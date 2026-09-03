@@ -528,6 +528,8 @@ class DirectAlias(NamedTuple):
     # and for the string-format aliases built below.
     api_key: str = ""
     key_env: str = ""
+    api_mode: str = ""
+    extra_body: Optional[dict] = None
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
@@ -588,6 +590,8 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                         model=model, provider=provider, base_url=base_url,
                         api_key=str(entry.get("api_key", "") or "").strip(),
                         key_env=str(entry.get("key_env", "") or "").strip(),
+                        api_mode=str(entry.get("api_mode", "") or entry.get("transport", "") or "").strip(),
+                        extra_body=dict(entry["extra_body"]) if isinstance(entry.get("extra_body"), dict) else None,
                     )
 
         # --- model.aliases (from config set / hand-written config) ---
@@ -614,6 +618,8 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                             model=model,
                             provider=provider or current_provider or "custom",
                             base_url=str(value.get("base_url") or "").strip(),
+                            api_mode=str(value.get("api_mode") or value.get("transport") or "").strip(),
+                            extra_body=dict(value["extra_body"]) if isinstance(value.get("extra_body"), dict) else None,
                         )
                         continue
                     if not isinstance(value, str) or not value.strip():
@@ -769,6 +775,8 @@ class StartupModelRoute(NamedTuple):
     provider: str = ""
     base_url: str = ""
     api_key: str = ""
+    api_mode: str = ""
+    request_overrides: Optional[dict] = None
 
 
 def resolve_startup_model_route(
@@ -809,6 +817,8 @@ def resolve_startup_model_route(
                 model=direct.model,
                 provider=explicit_provider,
                 base_url=direct.base_url,
+                api_mode=direct.api_mode,
+                request_overrides=dict(direct.extra_body or {}) or None,
             )
         # Resolve through the SAME owner the interactive /model and oneshot
         # paths use: a URL-bearing alias must resolve its credential for the
@@ -822,6 +832,8 @@ def resolve_startup_model_route(
             provider=alias_provider,
             base_url=direct.base_url,
             api_key=alias_key or "",
+            api_mode=direct.api_mode,
+            request_overrides=dict(direct.extra_body or {}) or None,
         )
 
     if explicit_provider or "/" not in raw:

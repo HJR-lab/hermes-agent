@@ -116,7 +116,10 @@ class CLIAgentSetupMixin:
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
-        resolved_api_mode = runtime.get("api_mode", self.api_mode)
+        resolved_api_mode = (
+            getattr(self, "_startup_api_mode_override", "")
+            or runtime.get("api_mode", self.api_mode)
+        )
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
@@ -356,7 +359,9 @@ class CLIAgentSetupMixin:
         if service_tier != "priority":
             # None (normal) or auto/cold — the bounded window is applied per
             # request by agent.fast_mode, not pinned into request_overrides.
-            route["request_overrides"] = None
+            route["request_overrides"] = dict(
+                getattr(self, "_startup_request_overrides", {}) or {}
+            ) or None
             return route
 
         try:
@@ -367,7 +372,10 @@ class CLIAgentSetupMixin:
             )
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides
+        route["request_overrides"] = {
+            **(getattr(self, "_startup_request_overrides", {}) or {}),
+            **(overrides or {}),
+        } or None
         return route
 
     def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:

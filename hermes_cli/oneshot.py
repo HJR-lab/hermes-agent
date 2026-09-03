@@ -400,6 +400,8 @@ def _run_agent(
     effective_provider = (provider or "").strip() or None
     explicit_base_url_from_alias: Optional[str] = None
     explicit_api_key_from_alias: Optional[str] = None
+    alias_api_mode: Optional[str] = None
+    alias_request_overrides: Optional[dict] = None
     if effective_provider is None and (model or env_model):
         # Only auto-detect when the model was explicitly requested via arg or
         # env var (not when it came from config — that's the "use my defaults"
@@ -434,6 +436,8 @@ def _run_agent(
                     explicit_api_key_from_alias = None
                 if direct.base_url:
                     explicit_base_url_from_alias = direct.base_url.rstrip("/")
+                alias_api_mode = direct.api_mode or None
+                alias_request_overrides = dict(direct.extra_body or {}) or None
             else:
                 cfg_provider = ""
                 if isinstance(model_cfg, dict):
@@ -494,7 +498,7 @@ def _run_agent(
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
             requested_provider=runtime.get("requested_provider"),
-            api_mode=runtime.get("api_mode"),
+            api_mode=alias_api_mode or runtime.get("api_mode"),
             model=effective_model,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
@@ -502,6 +506,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            request_overrides=alias_request_overrides,
             ephemeral_system_prompt=skills_prompt,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:

@@ -5378,6 +5378,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _startup_provider_override = ""
         _startup_base_url_override = ""
         _startup_api_key_override = ""
+        _startup_api_mode_override = ""
+        _startup_request_overrides = None
         if self.model:
             from hermes_cli.model_switch import resolve_startup_model_route
 
@@ -5399,6 +5401,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _startup_provider_override = _startup_route.provider
                 _startup_base_url_override = _startup_route.base_url
                 _startup_api_key_override = _startup_route.api_key
+                _startup_api_mode_override = _startup_route.api_mode
+                _startup_request_overrides = _startup_route.request_overrides
         # A ``moa:<preset>`` model string selects the MoA virtual provider in
         # one shot (parity with interactive ``/moa`` and the model picker). Do
         # this before provider resolution so ``-Q -m moa:<preset>`` routes
@@ -5438,7 +5442,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # An explicit --api-key wins; otherwise a URL-bearing startup alias
         # carries its own credential for the alias host (#28660).
         self._explicit_api_key = api_key or _startup_api_key_override or None
-        self._explicit_base_url = base_url
+        # Keep a direct alias endpoint explicit through the credential refresh;
+        # otherwise bare ``custom`` is re-resolved against the ambient default.
+        self._explicit_base_url = base_url or _startup_base_url_override
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
@@ -5473,7 +5479,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._model_is_default = False
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
-        self.api_mode = "chat_completions"
+        self.api_mode = _startup_api_mode_override or "chat_completions"
+        self._startup_api_mode_override = _startup_api_mode_override
+        self._startup_request_overrides = dict(_startup_request_overrides or {})
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
         self.base_url = (
