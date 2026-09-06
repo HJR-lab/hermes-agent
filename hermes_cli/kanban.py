@@ -1639,6 +1639,75 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_requested_skills(
+    assignee: object,
+    skills: object,
+) -> Optional[str]:
+    """Return an error message when a requested skill will not load for ``assignee``.
+
+    ``--skill`` names are force-loaded by the worker at bootstrap. Until this
+    guard existed the names went straight into the row unchecked, and an
+    author-side name that the ASSIGNEE's profile cannot resolve only surfaced
+    about a second into the spawned worker, as ``Unknown skill(s): ...`` in
+    ``~/.hermes/kanban/logs/<task_id>.log`` — a file nothing surfaces on the
+    board. Seven deus/duex cards were killed that way between 2026-09-03 and
+    2026-09-06 and none of them ever ran.
+
+    The catalog comes from ``kb.installed_skills_for_profile``, the same probe
+    the dispatcher's spawn-time guard uses, so authoring and worker startup
+    cannot disagree about what a profile resolves.
+
+    Fails OPEN: a probe that could not be trusted (``None``) lets the card
+    through unchanged. Refusing to create cards because a subprocess misbehaved
+    would be worse than the bug this prevents. An empty catalog is a real
+    answer and DOES reject — a profile that resolves nothing can never satisfy
+    a ``--skill`` request.
+    """
+    wanted = [n for n in (skills or ()) if n]
+    if not wanted:
+        return None
+
+    name = str(assignee).strip() if assignee else ""
+    if not name:
+        return (
+            "kanban create: --skill requires --assignee — a skill name is only "
+            "meaningful against the profile that will run the card."
+        )
+
+    # Normalization, the catalog probe and the fail-open rule live in
+    # ``kb.check_requested_skills`` so this guard and the agent-tool guard in
+    # ``tools/kanban_tools.py::_handle_create`` cannot drift apart. ``None``
+    # means "nothing to enforce" — no names, or a probe that could not be
+    # trusted; either way the card goes through unchanged.
+    check = kb.check_requested_skills(assignee, skills)
+    if check is None:
+        return None
+
+    profile = check.profile
+    missing = check.missing
+    if not missing:
+        return None
+
+    available = check.resolvable
+    lines = [
+        f"kanban create: unknown skill(s) for assignee '{name}': "
+        + ", ".join(missing),
+    ]
+    if available:
+        lines.append(
+            f"  resolvable for '{name}' ({len(available)}): " + ", ".join(available)
+        )
+    else:
+        lines.append(
+            f"  profile '{profile}' resolves no skills at all — "
+            "it cannot run a card with --skill."
+        )
+    lines.append(
+        f"  no card was created. Check with: hermes -p {profile} skills list --enabled-only"
+    )
+    return "\n".join(lines)
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1661,6 +1730,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             "use 1 to trip on the first failure.",
             file=sys.stderr,
         )
+        return 2
+    skill_error = _validate_requested_skills(
+        getattr(args, "assignee", None), getattr(args, "skills", None)
+    )
+    if skill_error:
+        print(skill_error, file=sys.stderr)
         return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(

@@ -1360,6 +1360,148 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+def _handle_profile_skills(args: dict, **kw) -> str:
+    """Enumerate the skills a profile can actually load (read-only).
+
+    Closes the third leg of the skill/profile alignment fix. ``kanban_create``
+    documents the contract "the names must match skills installed on the
+    assignee's profile", but the calling agent sees only ITS OWN profile's
+    catalog and had no way to enumerate another profile's — an unsatisfiable
+    contract, which is why bad ``skills=[...]`` names kept reaching the board
+    and killing workers at bootstrap. Spawn-guard and create-time validation
+    now catch those names; this tool lets the author avoid writing them.
+
+    Reads the same probe both guards read
+    (``kanban_db.installed_skills_for_profile``), so what this reports and what
+    the guards enforce can never disagree.
+    """
+    name = _normalize_profile(args.get("assignee") or args.get("profile"))
+    if not name:
+        return tool_error(
+            "kanban_profile_skills: assignee is required — the profile whose "
+            "skill catalog you want (e.g. the assignee you are about to put "
+            "on a kanban_create call)"
+        )
+
+    try:
+        from hermes_cli.profiles import (
+            list_profile_names,
+            normalize_profile_name,
+            profile_exists,
+        )
+    except Exception as e:  # pragma: no cover - import guard
+        return tool_error(f"kanban_profile_skills: profile registry unavailable: {e}")
+
+    try:
+        profile = normalize_profile_name(name)
+    except Exception:
+        profile = name
+
+    try:
+        known = sorted(list_profile_names())
+    except Exception:
+        known = []
+
+    if not profile_exists(profile):
+        detail = f" Known profiles: {', '.join(known)}." if known else ""
+        return tool_error(
+            f"kanban_profile_skills: no profile named {profile!r}. A kanban card "
+            f"assigned to an unknown profile is never dispatched.{detail}"
+        )
+
+    wanted = [
+        str(n).strip()
+        for n in (args.get("skills") or ())
+        if str(n).strip()
+    ]
+    wanted = list(dict.fromkeys(wanted))
+
+    try:
+        from hermes_cli import kanban_db as kb_mod
+
+        installed = kb_mod.installed_skills_for_profile(profile)
+    except Exception as e:
+        logger.exception("kanban_profile_skills probe failed")
+        return tool_error(f"kanban_profile_skills: {e}")
+
+    if installed is None:
+        # Probe could not be trusted. Say so plainly rather than reporting an
+        # empty catalog, which would read as "this profile has no skills".
+        return json.dumps({
+            "ok": True,
+            "profile": profile,
+            "status": "unknown",
+            "skills": None,
+            "count": None,
+            "note": (
+                f"Could not read {profile!r}'s skill catalog (the "
+                f"`hermes -p {profile} skills list --enabled-only` probe did not "
+                "return a trustworthy answer). Create-time validation fails open "
+                "in this state, so a card will be accepted unverified."
+            ),
+        })
+
+    available = sorted(installed)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "profile": profile,
+        "status": "ok" if available else "empty",
+        "skills": available,
+        "count": len(available),
+    }
+    if not available:
+        payload["note"] = (
+            f"Profile {profile!r} resolves no enabled skills at all, so it "
+            "cannot run a card with `skills=[...]`. Create the card without "
+            "skills, or pick a different assignee."
+        )
+    if wanted:
+        payload["requested"] = wanted
+        payload["resolvable"] = [n for n in wanted if n in installed]
+        payload["unresolvable"] = [n for n in wanted if n not in installed]
+        if payload["unresolvable"]:
+            payload["note"] = (
+                "kanban_create will REJECT these names: "
+                + ", ".join(payload["unresolvable"])
+                + ". Drop them or install them on the assignee profile first."
+            )
+    return json.dumps(payload)
+
+
+def _validate_requested_skills(assignee: Any, skills: Any) -> Optional[str]:
+    """Return an error message when ``skills`` will not load for ``assignee``.
+
+    The agent tool is the SECOND authoring entry point for `--skills`, and
+    until this guard existed it was unguarded: an orchestrator calling
+    ``kanban_create(assignee="deus", skills=["translation"])`` wrote a row
+    whose names only exist in the CALLER's profile. The mismatch then
+    surfaced ~1s into the spawned worker as ``Unknown skill(s): ...`` in
+    ``~/.hermes/kanban/logs/<task_id>.log``, a file nothing renders on the
+    board — the card just looked like an unexplained dead pid.
+
+    Requested skills are capability REQUIREMENTS, not preferences, so an
+    unresolvable name is a hard rejection: better an actionable, retryable
+    tool error than a card that runs without the capabilities it was created
+    for. The probe, the effective-assignee normalization and the fail-open
+    rule are shared with the CLI guard via ``kb.check_requested_skills``:
+    ``None`` (unusable probe, or no names) passes through unchanged, an empty
+    catalog is authoritative and rejects.
+    """
+    if not skills:
+        return None
+    from hermes_cli import kanban_db as kb
+
+    check = kb.check_requested_skills(assignee, skills)
+    if check is None or not check.missing:
+        return None
+    resolvable = ", ".join(check.resolvable) if check.resolvable else "(none)"
+    return (
+        "Cannot create task: skill(s) not resolvable for assignee "
+        f"'{check.profile}': {', '.join(check.missing)}. "
+        f"Resolvable skills: {resolvable}. No task was created."
+    )
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1425,6 +1567,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    skill_error = _validate_requested_skills(assignee, skills)
+    if skill_error:
+        return tool_error(skill_error)
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
@@ -2149,6 +2294,43 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     },
 }
 
+KANBAN_PROFILE_SKILLS_SCHEMA = {
+    "name": "kanban_profile_skills",
+    "description": (
+        "List the skills a given profile can actually load, so you can check "
+        "a `kanban_create(skills=[...])` request BEFORE you make it. You only "
+        "see your own profile's skill catalog; another profile's is usually "
+        "different (a worker profile may carry one skill, or none). Naming a "
+        "skill the assignee cannot resolve is rejected at create time, so call "
+        "this first whenever you intend to pin skills on a card. Pass `skills` "
+        "to get a resolvable/unresolvable split for the exact names you plan "
+        "to send. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "assignee": {
+                "type": "string",
+                "description": (
+                    "Profile name whose skill catalog you want — the same "
+                    "value you would pass as `assignee` to kanban_create."
+                ),
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional skill names to check against that profile. The "
+                    "response splits them into `resolvable` and "
+                    "`unresolvable`; anything unresolvable would be refused "
+                    "by kanban_create."
+                ),
+            },
+        },
+        "required": ["assignee"],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -2277,7 +2459,11 @@ KANBAN_CREATE_SCHEMA = {
                     "context — e.g. ['translation'] for a translation "
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
-                    "assignee's profile."
+                    "assignee's profile — a name that profile cannot "
+                    "resolve is REJECTED and no card is created. Your own "
+                    "skill catalog is not the assignee's, so check first "
+                    "with `kanban_profile_skills(assignee=..., "
+                    "skills=[...])`."
                 ),
             },
             "goal_mode": {
@@ -2479,6 +2665,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_profile_skills",
+    toolset="kanban",
+    schema=KANBAN_PROFILE_SKILLS_SCHEMA,
+    handler=_handle_profile_skills,
+    check_fn=_check_kanban_mode,
+    emoji="🧩",
 )
 
 registry.register(

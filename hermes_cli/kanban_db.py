@@ -3404,6 +3404,33 @@ def create_task(
             )
         skills_list = cleaned
 
+        # Reject names the assignee's profile cannot actually load. The tool
+        # schema already states the contract ("names must match skills
+        # installed on the assignee's profile") but nothing enforced it, and
+        # the author has no way to check: an agent sees only ITS OWN profile's
+        # catalog. So the mismatch surfaced only at spawn, ~1s into a worker,
+        # in a per-task log nothing renders on the board (incident 2026-09-06
+        # t_1891af08). Fail here instead, where the author can act on it.
+        #
+        # Fails OPEN via resolvable_skills_for_profile: a broken probe must
+        # never block card creation.
+        if skills_list and assignee:
+            try:
+                from hermes_cli.profiles import normalize_profile_name
+                _prof = normalize_profile_name(assignee)
+            except Exception:
+                _prof = assignee
+            _keep, _bad = resolvable_skills_for_profile(_prof, skills_list)
+            if _bad:
+                raise ValueError(
+                    "skill(s) not installed/enabled on profile "
+                    f"{_prof!r}: {', '.join(repr(n) for n in _bad)}. "
+                    "A worker cannot load them, so the card would spawn "
+                    "without them. See what that profile can load with "
+                    f"`hermes -p {_prof} skills list --enabled-only`, or "
+                    "create the card without those names."
+                )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -10743,6 +10770,206 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     )
 
 
+def installed_skills_for_profile(
+    profile: str,
+    *,
+    timeout: float = 30.0,
+) -> Optional[set[str]]:
+    """Return the skill names that resolve under ``profile``'s HERMES_HOME.
+
+    This is the single source of truth for "what will `--skills <name>` find
+    once a worker switches to the assignee's profile-scoped ``HERMES_HOME``?".
+    Both the dispatcher's spawn-time guard (``resolvable_skills_for_profile``)
+    and the ``hermes kanban create`` authoring guard read it, so the two can
+    never disagree about a profile's catalog.
+
+    The check MUST run out-of-process. ``agent/skill_commands.py`` resolves
+    skills against ``get_all_skills_dirs()``, but its ``SKILLS_DIR`` is frozen
+    at import time (see the comment at skill_commands.py:459) — the same
+    ``HERMES_HOME`` caching hazard ``_default_spawn`` already documents for
+    ``config.yaml``. A parent that imported the resolver under the dispatcher's
+    root home would report the ROOT catalog, which is exactly the mismatch this
+    guard exists to catch. So we shell out to the supported probe:
+    ``hermes -p <profile> skills list --enabled-only``.
+
+    ``--enabled-only`` matters: ``build_preloaded_skills_prompt`` treats a
+    disabled skill as missing, so a probe that counted disabled skills would
+    still let a worker die.
+
+    Returns ``None`` when the probe could not be trusted — the binary would not
+    launch, it exited nonzero, or its output parsed inconsistently. Callers
+    must treat ``None`` as "unknown, assume fine" rather than as "no skills".
+    An EMPTY SET is a real answer: the profile resolves nothing at all (the
+    ``.no-bundled-skills`` case), and the summary line is what tells the two
+    apart.
+    """
+    import re
+    import subprocess
+
+    argv = [
+        *_resolve_hermes_argv(),
+        "-p", profile,
+        "skills", "list", "--enabled-only",
+    ]
+    try:
+        probe_env = dict(os.environ)
+        # Wide terminal: the Rich table truncates skill names to fit, and a
+        # truncated name would read as unresolvable and be wrongly stripped.
+        probe_env["COLUMNS"] = "400"
+        probe_env.pop("HERMES_TUI", None)
+        out = subprocess.run(  # noqa: S603 -- argv is a fixed list built above
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=probe_env,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+
+    text = out.stdout or ""
+    installed: set[str] = set()
+    for line in text.splitlines():
+        if not line.startswith("│"):
+            continue
+        cells = [c.strip() for c in line.strip("│").split("│")]
+        if not cells:
+            continue
+        name = cells[0]
+        # Skip the header row and any rule/continuation lines.
+        if not name or name == "Name" or name.startswith("─"):
+            continue
+        installed.add(name)
+
+    # `do_list` always prints "... — N enabled shown" under the table. It is
+    # the only signal that separates "this profile genuinely has no skills"
+    # from "the table did not parse", so an empty set is only ever returned
+    # when the summary agrees.
+    match = re.search(r"(\d+)\s+enabled shown", text)
+    if match is not None:
+        expected = int(match.group(1))
+        if len(installed) == expected:
+            return installed
+        # Table and summary disagree (wrapped output, truncation, a future
+        # format change) — refuse to guess.
+        return None
+    if installed:
+        return installed
+    # Parsed neither names nor a summary — treat as a probe failure rather
+    # than as "profile has no skills", which would strip every name.
+    return None
+
+
+@dataclass(frozen=True)
+class RequestedSkillCheck:
+    """Result of comparing requested skill names against a profile's catalog.
+
+    ``profile`` is the EFFECTIVE assignee — the normalized profile id the
+    dispatcher will actually spawn (``_canonical_assignee`` stores the same
+    normalization on the row), so the catalog and the name reported back to
+    the author always describe the same profile.
+
+    ``missing`` keeps request order; ``resolvable`` is sorted for a stable,
+    diffable listing.
+    """
+
+    profile: str
+    missing: list[str]
+    resolvable: list[str]
+
+
+def check_requested_skills(
+    assignee: object,
+    names: Iterable[str],
+    *,
+    timeout: float = 30.0,
+) -> Optional[RequestedSkillCheck]:
+    """Compare requested skill names with the assignee profile's catalog.
+
+    Returns ``None`` when there is nothing to enforce: no usable names were
+    requested, or the catalog probe could not be trusted (``installed_skills_
+    for_profile`` returned ``None``). Both mean "let the request through
+    unchanged" — refusing work because a subprocess misbehaved would be worse
+    than the mismatch the guard exists to catch.
+
+    An EMPTY catalog is a real answer and is authoritative: a profile that
+    resolves nothing can never satisfy a skill request, so every requested
+    name comes back in ``missing``.
+
+    This is the shared core behind the authoring-time guards on both entry
+    points — ``hermes kanban create`` (``hermes_cli/kanban.py::
+    _validate_requested_skills``) and the agent tool
+    (``tools/kanban_tools.py::_handle_create``). They render different
+    messages for different audiences, but the probe, the normalization and
+    the fail-open rule live here so the two cannot drift apart. Note this is
+    deliberately STRICTER than the dispatcher's spawn-time
+    ``resolvable_skills_for_profile``, which also fails open on an empty
+    catalog: at spawn the only alternative is killing a claimed card, while
+    at authoring time the caller can still fix the request.
+    """
+    # Names are compared VERBATIM (only falsy entries dropped, order-preserving
+    # dedupe) — exactly what `_validate_requested_skills` did before this became
+    # shared. Deliberately not stripped: changing that would change which CLI
+    # invocations are rejected, and this refactor must not move CLI behaviour.
+    wanted = list(dict.fromkeys(str(n) for n in (names or ()) if n))
+    if not wanted:
+        return None
+
+    raw = str(assignee).strip() if assignee else ""
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        profile = normalize_profile_name(raw)
+    except Exception:
+        profile = raw
+
+    installed = installed_skills_for_profile(profile, timeout=timeout)
+    if installed is None:
+        return None
+
+    return RequestedSkillCheck(
+        profile=profile,
+        missing=[n for n in wanted if n not in installed],
+        resolvable=sorted(installed),
+    )
+
+
+def resolvable_skills_for_profile(
+    profile: str,
+    names: Iterable[str],
+    *,
+    timeout: float = 30.0,
+) -> tuple[list[str], list[str]]:
+    """Split ``names`` into (resolvable, unresolvable) for ``profile``.
+
+    Answers the one question a dispatched worker cannot answer for itself:
+    will ``--skills <name>`` actually load once the child switches to the
+    assignee's profile-scoped ``HERMES_HOME``? Delegates the catalog lookup to
+    ``installed_skills_for_profile``.
+
+    Fails OPEN — on any probe error, and on an empty catalog, every name is
+    reported resolvable. A broken probe must not be able to strip skills off an
+    otherwise healthy worker; the pre-existing behaviour (worker decides) is
+    the safe fallback.
+    """
+    wanted = [n for n in (names or ()) if n]
+    if not wanted:
+        return [], []
+
+    installed = installed_skills_for_profile(profile, timeout=timeout)
+    if not installed:
+        # None (probe failed) or empty (nothing parsed) — both fail open here,
+        # preserving the dispatcher's long-standing spawn behaviour.
+        return list(wanted), []
+
+    resolvable = [n for n in wanted if n in installed]
+    unresolvable = [n for n in wanted if n not in installed]
+    return resolvable, unresolvable
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10896,10 +11123,23 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
+    # Guard: a skill name that will not resolve under the assignee's
+    # profile-scoped HERMES_HOME kills the worker roughly a second into
+    # bootstrap. cli.py raises ValueError when EVERY requested skill is
+    # missing, and the message lands only in this task's worker log — nothing
+    # reaches the board, so the card presents as an unexplained "pid gone"
+    # (incident 2026-09-06 t_1891af08: four cards, and three older ones,
+    # stuck this way since 2026-09-03 with no visible cause).
+    #
+    # Drop unresolvable names here instead, and say so on the card. A typo'd
+    # or profile-missing skill must degrade the worker, never silently kill it.
+    dropped_skills: list[str] = []
     if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
+        keep, dropped_skills = resolvable_skills_for_profile(
+            profile_arg, task.skills
+        )
+        for sk in keep:
+            cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
@@ -10967,6 +11207,27 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if dropped_skills:
+        # Say it on the board. The whole point of the guard is that this
+        # stops being invisible — a reader of the card must be able to see
+        # that the worker ran WITHOUT the skills the author asked for.
+        note = (
+            "Skill guard: dropped {n} unresolvable skill name(s) before spawn "
+            "— {names}. They are not installed/enabled on profile "
+            "'{profile}'. The worker was launched WITHOUT them rather than "
+            "being killed at bootstrap. Check with: "
+            "`hermes -p {profile} skills list --enabled-only`."
+        ).format(
+            n=len(dropped_skills),
+            names=", ".join(dropped_skills),
+            profile=profile_arg,
+        )
+        try:
+            with contextlib.closing(connect()) as _c:
+                add_comment(_c, task.id, "dispatcher", note)
+        except Exception:
+            # Never let bookkeeping break a spawn that already succeeded.
+            logging.getLogger(__name__).warning("kanban: %s", note)
     return proc.pid
 
 
