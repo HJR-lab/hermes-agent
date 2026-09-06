@@ -2931,8 +2931,31 @@ def block_task(
         if cur_row is None:
             return False
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        effective_kind = kind
+        if kind == "dependency":
+            # A dependency block parks the task in ``todo`` to wait for
+            # ``recompute_ready``. With no OPEN parent there is nothing to wait
+            # for, so recompute_ready promotes it straight back to ``ready``
+            # and the dispatcher respawns it — the block silently did nothing.
+            # Observed 2026-09-06 while containing a duplicate worker: the card
+            # was blocked, came back ready within a tick, and spawned again.
+            # Downgrade to a real ``blocked`` so the caller's actual intent
+            # (stop this card) holds, and record that we did.
+            open_parents = conn.execute(
+                "SELECT 1 FROM tasks t JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ? AND t.status NOT IN ('done', 'archived') "
+                "LIMIT 1", (task_id,),
+            ).fetchone()
+            if open_parents is None:
+                effective_kind = "needs_input"
+                reason = (
+                    f"{reason} " if reason else ""
+                ) + (
+                    "[dependency block downgraded: task has no open parents, so "
+                    "a dependency wait would be promoted straight back to ready]"
+                )
         new_status, event_kind, set_sql, params, payload = _route_block(
-            kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+            effective_kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
         sql = f"""
@@ -2956,7 +2979,7 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
+        if effective_kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
             return True
