@@ -20,6 +20,7 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 from typing import Callable
+from typing import Iterable
 from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
@@ -2083,6 +2084,78 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def installed_skills_for_profile(
+    profile: str,
+    *,
+    timeout: float = 30.0,
+) -> Optional[set[str]]:
+    """Skill names that resolve under ``profile``'s HERMES_HOME, or None.
+
+    ``None`` means "could not be determined" (probe failed) and is distinct
+    from an empty set, which is a real answer.
+
+    The probe MUST run out-of-process. Skill resolution reads
+    ``get_all_skills_dirs()``, but ``SKILLS_DIR`` is frozen at import time, so
+    an in-process check under the dispatcher's root HERMES_HOME would report
+    the ROOT catalog -- exactly the mismatch this exists to catch, and the
+    same caching hazard ``_default_spawn`` already documents for config.yaml.
+    ``--enabled-only`` matters: a disabled skill counts as missing to
+    ``build_preloaded_skills_prompt``.
+    """
+    import subprocess
+    argv = [*_resolve_hermes_argv(), "-p", profile,
+            "skills", "list", "--enabled-only"]
+    try:
+        probe_env = dict(os.environ)
+        # Wide terminal: the Rich table truncates names to fit, and a
+        # truncated name would read as unresolvable and be wrongly stripped.
+        probe_env["COLUMNS"] = "400"
+        probe_env.pop("HERMES_TUI", None)
+        out = subprocess.run(  # noqa: S603 -- fixed argv built above
+            argv, capture_output=True, text=True, timeout=timeout,
+            env=probe_env, stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    names: set[str] = set()
+    for line in (out.stdout or "").splitlines():
+        if not line.startswith("\u2502"):
+            continue
+        cells = [c.strip() for c in line.strip("\u2502").split("\u2502")]
+        if not cells:
+            continue
+        n = cells[0]
+        if not n or n == "Name" or n.startswith("\u2500"):
+            continue
+        names.add(n)
+    if not names:
+        # Parsed nothing at all -> treat as probe failure, not "no skills",
+        # which would strip every requested name.
+        return None
+    return names
+
+
+def resolvable_skills_for_profile(
+    profile: str,
+    names: Iterable[str],
+) -> tuple[list[str], list[str]]:
+    """Split ``names`` into (resolvable, unresolvable) for ``profile``.
+
+    Fails OPEN: if the catalog cannot be determined every name is reported
+    resolvable. A broken probe must not strip skills off a healthy worker.
+    """
+    wanted = [n for n in (names or ()) if n]
+    if not wanted:
+        return [], []
+    installed = installed_skills_for_profile(profile)
+    if installed is None:
+        return list(wanted), []
+    return ([n for n in wanted if n in installed],
+            [n for n in wanted if n not in installed])
+
+
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
@@ -2098,9 +2171,22 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     ]
     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
     # ambiguity if a skill name contains unusual chars.
-    for sk in task.skills or ():
-        if sk:
-            cmd.extend(["--skills", sk])
+    #
+    # Guard: a name that will not resolve under the assignee's profile-scoped
+    # HERMES_HOME kills the worker ~1s into bootstrap -- cli.py raises when
+    # EVERY requested skill is missing, and that message lands only in the
+    # per-task worker log, so the card just shows "pid gone" (incident
+    # 2026-09-06 t_1891af08: ten cards stuck, four for three days). Drop the
+    # unresolvable names instead; a typo must degrade a worker, never kill it.
+    keep, dropped = resolvable_skills_for_profile(profile_arg, task.skills or ())
+    if dropped:
+        _kb._log.warning(
+            "kanban worker %s: dropped unresolvable skill(s) for profile %r: %s "
+            "(check: hermes -p %s skills list --enabled-only)",
+            getattr(task, "id", "?"), profile_arg, ", ".join(dropped), profile_arg,
+        )
+    for sk in keep:
+        cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too so the worker resolves the model against the
