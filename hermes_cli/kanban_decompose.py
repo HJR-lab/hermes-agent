@@ -295,6 +295,67 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     )
 
 
+# Words that carry no scope signal — dropping them keeps the overlap check
+# from firing on shared boilerplate ("the", "for", "review", "task").
+_SCOPE_STOPWORDS = frozenset({
+    "a", "an", "and", "at", "against", "for", "from", "in", "into", "of", "on",
+    "or", "the", "to", "via", "with", "when", "that", "this", "its", "it",
+    "task", "card", "tasks", "cards",
+})
+# Overlap coefficient (shared / smaller set) rather than Jaccard: a short,
+# focused card and a long, detailed one about the SAME thing score low on
+# Jaccard purely because the longer title has more words.
+_SCOPE_OVERLAP_THRESHOLD = 0.5
+_SCOPE_MIN_SHARED = 3
+
+
+def _scope_tokens(title: str) -> set:
+    """Significant, lightly-stemmed tokens from a card title."""
+    words = re.findall(r"[a-z0-9]+", (title or "").lower())
+    out = set()
+    for w in words:
+        if w in _SCOPE_STOPWORDS or len(w) < 3:
+            continue
+        # Crude singularisation so skill/skills and profile/profiles match.
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        out.add(w)
+    return out
+
+
+def _overlapping_open_card(conn, task_id: str, title: str) -> Optional[tuple]:
+    """An OPEN card, other than ``task_id``, that already covers this scope.
+
+    Returns ``(id, title)`` or None. Deliberately advisory: the caller refuses
+    to decompose and leaves the card in triage for a human, rather than
+    deleting or merging anything on a similarity heuristic.
+
+    Exists because on 2026-09-06 the decomposer fanned out the SAME problem
+    twice, 17 minutes apart, into seven cards, while a claimed card was
+    already working it. Two of the resulting workers then edited the same
+    source files concurrently.
+    """
+    mine = _scope_tokens(title)
+    if len(mine) < _SCOPE_MIN_SHARED:
+        return None
+    rows = conn.execute(
+        "SELECT id, title FROM tasks "
+        "WHERE id != ? AND status IN ('ready', 'running', 'todo', 'review') "
+        "ORDER BY created_at DESC LIMIT 400",
+        (task_id,),
+    ).fetchall()
+    for r in rows:
+        other = _scope_tokens(r["title"])
+        if not other:
+            continue
+        shared = mine & other
+        if len(shared) < _SCOPE_MIN_SHARED:
+            continue
+        if len(shared) / min(len(mine), len(other)) >= _SCOPE_OVERLAP_THRESHOLD:
+            return (r["id"], r["title"])
+    return None
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -307,6 +368,22 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # Do not fan out scope an open card already owns. Decomposing it again
+    # produces a second implementer for the same work, and two dispatched
+    # workers editing the same files is a corruption hazard, not just wasted
+    # tokens (incident 2026-09-06, t_d0888211).
+    try:
+        with kbc.connect_closing() as _c:
+            dupe = _overlapping_open_card(_c, task_id, task.title)
+    except Exception:
+        dupe = None  # Never let the guard block decomposition on a DB hiccup.
+    if dupe is not None:
+        return DecomposeOutcome(
+            task_id, False,
+            f"scope already owned by open card {dupe[0]} ({dupe[1]!r}) — "
+            f"left in triage for a human to merge or override",
+        )
 
     routing = _load_routing()
     raw, reason = _call_aux(
