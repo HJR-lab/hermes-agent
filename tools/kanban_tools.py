@@ -371,12 +371,39 @@ _GOAL_GATE_MESSAGES = {
             "matching the card before requesting review.")}}
 
 
-def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
+def _note_unjudged(kb, conn, tid: str, tool_name: str, why: str) -> None:
+    """Record on the card that a goal_mode handoff proceeded WITHOUT judge verification.
+
+    The gate fails open so a broken judge cannot wedge the board, but a silent skip means the
+    quality gate can disappear without anyone noticing — an unavailable judge and a passing judge
+    become indistinguishable on the board. Leave a durable marker instead. Best-effort: never raise
+    into the lifecycle call, since the whole point is not to block completion."""
+    logger.warning("goal gate BYPASSED for %s (%s): %s", tid, tool_name, why)
+    if kb is None or conn is None:
+        return
+    try:
+        kb.add_comment(
+            conn, tid, author="hermes-system",
+            body=(f"UNJUDGED {tool_name}: the goal-mode acceptance judge did NOT verify this handoff "
+                  f"- {why}. The lifecycle transition was allowed so the board does not wedge, but the "
+                  f"acceptance criteria were not machine-checked. Treat this card as self-reported: "
+                  f"re-verify before relying on it as done."))
+    except Exception:  # pragma: no cover - defensive, must never block the handoff
+        logger.warning("could not record unjudged handoff on %s", tid, exc_info=True)
+
+
+def _goal_gate(tool_name: str, task, tid: str, evidence: str, kb=None, conn=None) -> None:
     """Goal-mode pre-handoff judge gate: a worker must not complete / request
     review before acceptance criteria are met. ``blocked`` gets its own
     guidance; any other non-``done`` verdict gets the ``continue`` guidance.
-    A broken judge fails open (logged) so it cannot permanently wedge work."""
-    if not task or not task.goal_mode or not _goal_judge_available():
+    A broken judge fails open (logged AND recorded on the card) so it cannot
+    permanently wedge work while still leaving the gap visible."""
+    if not task or not task.goal_mode:
+        return
+    if not _goal_judge_available():
+        _note_unjudged(kb, conn, tid, tool_name,
+                       "no judge client could be built (auxiliary.goal_judge unset, unreachable, "
+                       "or its credentials were rejected)")
         return
     try:
         verdict, reason, _, _, transport_failed = judge_goal(
@@ -384,6 +411,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     except Exception as judge_exc:
         logger.warning(
             "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
+        _note_unjudged(kb, conn, tid, tool_name, f"judge raised {type(judge_exc).__name__}")
         return
     # ``judge_goal`` swallows transport errors and returns a well-formed ``continue`` verdict, so the
     # ``except`` above never fires for an unreachable judge. Without this the gate treats "could not
@@ -392,6 +420,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     if transport_failed:
         logger.warning(
             "goal judge unreachable (%s), allowing lifecycle handoff for %s", reason, tid)
+        _note_unjudged(kb, conn, tid, tool_name, f"judge unreachable - {reason}")
         return
     if verdict == "done":
         return
@@ -569,7 +598,7 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), kb, conn)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -649,7 +678,7 @@ def _handle_request_review(args: dict, **kw) -> str:
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary, kb, conn)
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=_worker_run_id(tid), with_reason=True)
