@@ -379,11 +379,19 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     if not task or not task.goal_mode or not _goal_judge_available():
         return
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, _, _, transport_failed = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
     except Exception as judge_exc:
         logger.warning(
             "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
+        return
+    # ``judge_goal`` swallows transport errors and returns a well-formed ``continue`` verdict, so the
+    # ``except`` above never fires for an unreachable judge. Without this the gate treats "could not
+    # ask" as "judge said no" and permanently wedges every goal_mode card (see the fail-open promise
+    # in this function's docstring and in ``_goal_judge_available``).
+    if transport_failed:
+        logger.warning(
+            "goal judge unreachable (%s), allowing lifecycle handoff for %s", reason, tid)
         return
     if verdict == "done":
         return
