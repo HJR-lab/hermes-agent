@@ -1159,7 +1159,7 @@ In some restricted networks, `api.telegram.org` may resolve to an IP that is unr
 ### How it works
 
 1. If `TELEGRAM_FALLBACK_IPS` is set, those IPs are used directly.
-2. Otherwise, the adapter automatically queries **Google DNS** and **Cloudflare DNS** via DNS-over-HTTPS (DoH) to discover alternative IPs for `api.telegram.org`.
+2. Otherwise, the adapter automatically queries **Google DNS** and **Cloudflare DNS** via DNS-over-HTTPS (DoH) to discover alternative IPs for `api.telegram.org`. Any seed-list IP not already discovered is appended to the result, so the walk always includes a genuinely distinct IPv4 path even when DoH returns the same single A record as system DNS.
 3. Known IPv4 Telegram API IPs are tried **before** the dual-stack `api.telegram.org` hostname. A blackholed IPv6 path can sit in `connect()` without erroring, which used to pin the event loop so the 30s init deadline never fired.
 4. If DoH is also blocked or times out, a hardcoded IPv4 seed list (`149.154.166.110`, `149.154.167.220`) is used as that IPv4-first list. The hostname remains last resort.
 5. Once a path succeeds, it becomes "sticky" — subsequent requests use it directly. The hostname is kept as a last resort for IPv6-only networks.

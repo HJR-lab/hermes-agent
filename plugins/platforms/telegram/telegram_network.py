@@ -235,12 +235,18 @@ async def _query_doh_provider(client: httpx.AsyncClient, provider: dict) -> list
 
 async def discover_fallback_ips() -> list[str]:
     """Resolve api.telegram.org via Google + Cloudflare DoH; unique A records, in order. IPs matching the
-    system resolver are deliberately KEPT (often the most reliable path). Falls back to
-    ``SEED_FALLBACK_IPS`` only when DoH yields nothing usable.
+    system resolver are deliberately KEPT (often the most reliable path). ``SEED_FALLBACK_IPS`` not already
+    present are appended, so the walk always includes a genuinely distinct IPv4 path even when DoH returns
+    exactly what system DNS does.
 
     IPs that match the local system resolver are kept rather than excluded: in many networks the system-DNS
     IP is the most reliable path to api.telegram.org and a transient primary-path failure should be retried
     against the same address via the IP-rewrite path before the seed list is consulted (#14520).
+
+    Seed augmentation: api.telegram.org commonly resolves to a single A record (149.154.166.110), and DoH
+    then "discovers" that identical IP — a fallback set equal to the primary DNS result gives zero
+    redundancy during an outage (t_236eb653). Appending the seeds after the discovered IPs adds a real
+    alternate Bot API endpoint at no cost on healthy networks: the transport stops at the first success.
     """
     async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
         system_dns_task = asyncio.ensure_future(asyncio.to_thread(_resolve_system_dns))
@@ -260,8 +266,13 @@ async def discover_fallback_ips() -> list[str]:
     doh_ips = [ip for r in results if isinstance(r, list) for ip in r]
     validated = _normalize_fallback_ips(list(dict.fromkeys(doh_ips)))  # dedupe, keep order
     if validated:
-        logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
-        return validated
+        # Augment with seed IPs not already discovered so the walk always has a genuinely
+        # distinct IPv4 path: DoH routinely returns the single system-DNS A record, making
+        # the "fallback" identical to the primary (t_236eb653). Seeds go last — on a healthy
+        # network the transport stops at the first success, so this costs nothing.
+        augmented = validated + [ip for ip in SEED_FALLBACK_IPS if ip not in validated]
+        logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(augmented))
+        return augmented
     logger.info(
         "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
         ", ".join(system_ips) or "unknown", ", ".join(SEED_FALLBACK_IPS))
