@@ -1301,6 +1301,23 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Fail HERE, not at spawn time. A persistent-kind task with no resolvable
+    # anchor is unrunnable: ``resolve_workspace`` refuses to guess a repo, so
+    # the dispatcher claims the card, crashes with ``spawn_failed``, and the
+    # card sits ``ready`` with no worker until someone notices. (2026-09-08:
+    # t_1c89d3a6 was created ``--workspace worktree`` with no path on a board
+    # with no ``default_workdir`` and sat undispatchable for 46 minutes.)
+    # Surfacing it to whoever creates the task turns a silent stall into an
+    # immediate, actionable error.
+    if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
+        raise ValueError(
+            f"workspace_kind={workspace_kind!r} requires a workspace_path: board "
+            f"{_slug_or_default(board)!r} has no default_workdir and no project repo "
+            f"is linked, so the workspace cannot be resolved at dispatch. Pass an "
+            f"absolute path (CLI: --workspace {workspace_kind}:<absolute-path>), set a "
+            f"board default_workdir, or use workspace_kind='scratch'."
+        )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()

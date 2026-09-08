@@ -173,12 +173,18 @@ def _insert_decomposed_child(
     """Insert one decomposed child as ``todo`` (linked under the root later so
     the dispatcher only ever sees a coherent graph); returns its id.
 
-    Workspace: per-child override wins, else inherit the root's kind. Path
-    inherits only when kinds match (a 'dir' child must not point at the
-    root's worktree) and NEVER for worktrees — siblings dispatch concurrently
-    and one shared checkout would put them all on the first sibling's branch
-    with no lock; leaving it unset makes dispatch materialize a fresh
-    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+    Workspace: per-child override wins, else inherit the root's kind. A path is
+    inherited ONLY for ``dir`` — a caller-chosen directory that completion
+    never removes and that siblings are meant to share.
+
+    ``worktree`` and ``scratch`` paths are never inherited: siblings dispatch
+    concurrently, so one shared checkout would put them all on the first
+    sibling's branch with no lock, and one shared scratch directory would race
+    their artifacts and let the first completion ``rmtree`` a workspace its
+    siblings and root are still using. Left unset, dispatch materializes a
+    fresh ``<repo>/.worktrees/<child-id>`` or ``<board>/workspaces/<child-id>``
+    per child. (Regression: the 2026-09-08 fan-out of t_89ebac10 gave three
+    concurrent children the root's scratch path.)
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
@@ -188,9 +194,7 @@ def _insert_decomposed_child(
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
     if child.get("workspace_path"):
         child_ws_path = child.get("workspace_path")
-    elif child_ws_kind == "worktree":
-        child_ws_path = None
-    elif child_ws_kind == root_ws_kind:
+    elif child_ws_kind == "dir" and root_ws_kind == "dir":
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None

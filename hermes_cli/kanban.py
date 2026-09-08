@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import os
 import shlex
@@ -1224,7 +1225,10 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     """Fan a triage task (or all) out into child tasks via the auxiliary LLM."""
     from hermes_cli import kanban_decompose as decomp
 
-    return _run_triage_sweep(args, "decompose", decomp, decomp.decompose_task, "decomposed",
+    # ``--force`` is an operator override for the prior-work guard; the
+    # gateway's auto-decompose path never sets it.
+    run_one = functools.partial(decomp.decompose_task, force=bool(getattr(args, "force", False)))
+    return _run_triage_sweep(args, "decompose", decomp, run_one, "decomposed",
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 

@@ -4088,16 +4088,9 @@ def _run_quiet_single_query(cli, effective_query):
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
     # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
     # the task without counting a failure (a quota window must not trip the breaker).
-    _exit_code = 0
-    if isinstance(result, dict) and result.get("failed"):
-        _exit_code = 1
-        if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
-            try:
-                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
-                _exit_code = _RL_CODE
-            except Exception:
-                _exit_code = 1
-    sys.exit(_exit_code)
+    from hermes_cli.kanban_worker_exit import worker_exit_code
+
+    sys.exit(worker_exit_code(result, kanban_task=os.environ.get("HERMES_KANBAN_TASK", "")))
 
 
 def _route_single_query_images(cli, query, effective_query, single_query_images, single_query_image_urls):
@@ -4415,6 +4408,22 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
+        # Kanban workers run THIS path, not the quiet one. Without an explicit
+        # exit code the process falls off the end at 0, and rc=0 on a task still
+        # marked ``running`` is booked as a protocol violation — which is how a
+        # provider outage turned into 135 phantom "worker exited cleanly" runs
+        # on 2026-09-08. Only a quota wall changes the code; every other outcome
+        # keeps the previous behaviour.
+        _kanban_task = os.environ.get("HERMES_KANBAN_TASK", "")
+        if _kanban_task:
+            from hermes_cli.kanban_worker_exit import quota_wall_reason
+
+            if quota_wall_reason(getattr(cli, "last_turn_result", None)) is not None:
+                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+                # SystemExit unwinds through the enclosing ``finally``, which
+                # runs _finalize_single_query — do not call it here as well.
+                sys.exit(KANBAN_RATE_LIMIT_EXIT_CODE)
     finally:
         _finalize_single_query(cli)
 

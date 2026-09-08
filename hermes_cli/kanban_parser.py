@@ -403,7 +403,13 @@ _SPECS = [
          help="Flesh out a triage-column task into a concrete spec (title + "
               "body) and promote it to todo. Uses the auxiliary LLM "
               "configured under auxiliary.triage_specifier."),
-    _cmd("decompose", _triage_sweep_args("decompose", "Decompose", "decomposer"),
+    _cmd("decompose", (
+            *_triage_sweep_args("decompose", "Decompose", "decomposer"),
+            _arg("--force", action="store_true",
+                 help="Decompose even when the task already has prior work (runs, "
+                      "started_at, or a terminal event). Off by default so a card "
+                      "that was already executed is not fanned out into duplicates."),
+         ),
          help="Decompose a triage-column task into a graph of child tasks "
               "routed to specialist profiles by description. Falls back "
               "to specify-style single-task promotion when the task "

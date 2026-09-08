@@ -41,6 +41,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    automatic_general_assignees: Any
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -111,6 +112,10 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # reconciliation); false keeps orphans frozen for manual forensics.
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),
         default_assignee=default_assignee,
+        # Allow-list of assignees the dispatcher may auto-spawn. Unset means
+        # "no allow-list"; an explicit list is a containment control, so it is
+        # passed through verbatim rather than coerced to a truthy check.
+        automatic_general_assignees=kanban_cfg.get("automatic_general_assignees"),
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
@@ -291,11 +296,60 @@ class _KanbanDispatcher:
         return 1
 
 
+_announced_provider_walls: set = set()
+"""``(board_slug, provider, resets_at)`` already logged. A wall lasts hours at a
+60s tick, so the notice is emitted on change, not on every tick."""
+
+
+def _reset_provider_wall_notices() -> None:
+    """Clear the announced-wall throttle (tests; also on dispatcher restart)."""
+    _announced_provider_walls.clear()
+
+
+def _format_wall_reset(resets_at) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(resets_at)))
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _log_provider_walls(slug: str, res) -> None:
+    """One line per newly-walled provider, however many cards it is holding.
+
+    A quota wall is not a task failure and needs no operator action, but a
+    silently motionless board does need explaining -- the dispatcher's summary
+    line only fires on a spawn, so a fully walled board would otherwise log
+    nothing at all.
+    """
+    notices = list(getattr(res, "provider_wall_notices", None) or [])
+    held = list(getattr(res, "skipped_provider_walled", None) or [])
+    if not notices:
+        # Wall cleared for this board: re-arm so a later outage is reported.
+        for key in [k for k in _announced_provider_walls if k[0] == slug]:
+            _announced_provider_walls.discard(key)
+        return
+    for provider, resets_at in notices:
+        key = (slug, provider, resets_at)
+        if key in _announced_provider_walls:
+            continue
+        _announced_provider_walls.add(key)
+        count = sum(1 for entry in held if len(entry) > 2 and entry[2] == provider)
+        logger.warning(
+            "kanban dispatcher [%s]: provider quota wall — %s is out of quota; "
+            "holding %d card(s) until it resets at %s. Not a task failure; "
+            "they dispatch on their own once quota returns.",
+            slug, provider, count, _format_wall_reset(resets_at),
+        )
+
+
 def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False
     for slug, res in (results or []):
-        if res is not None and getattr(res, "spawned", None):
+        if res is None:
+            continue
+        _log_provider_walls(slug, res)
+        if getattr(res, "spawned", None):
             any_spawned = True
             # Quiet by default: an idle gateway stays silent.
             logger.info(

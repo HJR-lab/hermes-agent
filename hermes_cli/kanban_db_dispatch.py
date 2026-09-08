@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 from typing import Any
+from typing import Iterable
 from typing import Callable
 from typing import Mapping
 from typing import Optional
@@ -110,6 +111,16 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_provider_walled: list[tuple[str, str, str, Optional[float]]] = field(default_factory=list)
+    """``(task_id, assignee, provider, resets_at)`` held because EVERY provider
+    in the assignee's chain is out of quota. NOT a failure and NOT operator-
+    actionable — the card dispatches on its own once the window resets. Kept
+    apart from ``skipped_nonspawnable`` so health telemetry does not read a
+    provider outage as a broken board."""
+    provider_wall_notices: list[tuple[str, Optional[float]]] = field(default_factory=list)
+    """De-duplicated ``(provider, resets_at)`` for this tick. One entry per
+    walled provider no matter how many cards it held, so an outage produces one
+    board-level notice rather than one per card."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -874,14 +885,24 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection, crash_details: list, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) trip
     immediately.
+
+    ``failure_limit`` is the dispatcher's configured breaker limit — the same
+    number ``recompute_ready`` gates re-promotion on. The violation budget is
+    floored at it so a board configured above
+    ``_PROTOCOL_VIOLATION_FAILURE_LIMIT`` cannot trip here and then be
+    re-promoted there.
     """
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, _, err_text in crash_details:
@@ -895,7 +916,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 continue  # task deleted mid-loop
             task_override = _kb._row_get(trow, "max_retries")
             violation_limit = (
-                int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                int(task_override) if task_override is not None
+                else max(_PROTOCOL_VIOLATION_FAILURE_LIMIT, int(failure_limit))
             )
             if streak < violation_limit:
                 # Below budget: already back at ``ready`` with the error stamped.
@@ -934,7 +956,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -946,7 +970,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     sweep = _reclaim_dead_workers(conn)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = (
+        _account_crashes(conn, sweep.crash_details, failure_limit=failure_limit)
+        if sweep.crash_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -1060,6 +1087,15 @@ def _record_task_failure(
                 )
             return False
 
+        # A trip must be self-consistent with the breaker state it leaves
+        # behind: ``recompute_ready`` refuses to re-promote a blocked task only
+        # while ``consecutive_failures >= effective_limit``. ``force_trip``
+        # callers applied their own bounded budget (the protocol-violation
+        # streak) and would otherwise land here with a counter of 1 — the
+        # dispatcher would then promote the just-given-up task straight back to
+        # ``ready`` and spawn another doomed worker. Persist the limit the
+        # breaker actually tripped on so give-up is durable.
+        failures = max(failures, effective_limit)
         # Spawn path (release_claim) is still running and also clears claim
         # state; the timeout/crash path already did.
         conn.execute(
@@ -1224,6 +1260,17 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     except Exception:
         return None
     return profile_exists
+
+
+def _walled_provider_fn() -> Optional[Callable[[str], object]]:
+    """``kanban_provider_gate.walled_provider_for``, or ``None`` when it cannot
+    be imported (local import avoids a cycle; callers fall back to dispatching,
+    which is the fail-open behaviour the gate itself guarantees)."""
+    try:
+        from hermes_cli.kanban_provider_gate import walled_provider_for
+    except Exception:
+        return None
+    return walled_provider_for
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
@@ -1428,6 +1475,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    automatic_general_assignees: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -1451,6 +1499,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            automatic_general_assignees=automatic_general_assignees,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -1501,12 +1550,22 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    allowed_assignees: Optional[set[str]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Escalation gate + general allow-list, BEFORE any other spawn reasoning.
+    # A governed escalation row never falls through to the allow-list in either
+    # direction; see hermes_cli.kanban_escalation. Both controls were silently
+    # lost once (t_919cc864 / t_983e8288) — keep them first and keep them here.
+    from hermes_cli import kanban_escalation as _esc
+    _ok, _reason = _esc.may_auto_spawn(conn, row, assignee, allowed_assignees)
+    if not _ok:
+        result.skipped_nonspawnable.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -1515,6 +1574,26 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
+    # Provider wall: when EVERY provider in this assignee's chain is out of
+    # quota, a spawn can only produce a 429 -> rc=0 -> "protocol violation" and
+    # burn the card's retry budget for something that is not the card's fault
+    # (2026-09-08: 128 such runs, 28 cards falsely blocked). Hold the card
+    # instead; it dispatches on a later tick once the window resets. Fails open
+    # on every unknown, so a broken quota monitor cannot freeze the board.
+    walled_provider_for = _walled_provider_fn()
+    if walled_provider_for is not None:
+        try:
+            wall = walled_provider_for(assignee)
+        except Exception:
+            wall = None
+        if wall is not None:
+            result.skipped_provider_walled.append(
+                (task_id, assignee, wall.provider, wall.resets_at)
+            )
+            notice = (wall.provider, wall.resets_at)
+            if notice not in result.provider_wall_notices:
+                result.provider_wall_notices.append(notice)
+            return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -1638,7 +1717,7 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
@@ -1760,6 +1839,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    automatic_general_assignees: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -1807,10 +1887,13 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    from hermes_cli import kanban_escalation as _esc_mod
+    _allowed_assignees = _esc_mod.normalize_general_assignees(automatic_general_assignees)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        allowed_assignees=_allowed_assignees,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

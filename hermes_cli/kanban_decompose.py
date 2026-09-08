@@ -296,18 +296,73 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     )
 
 
+def _prior_work_reason(task_id: str) -> Optional[str]:
+    """Why this card must not be auto-decomposed, or None when it is fresh.
+
+    A card sitting in ``triage`` that has already been *executed* is not a raw
+    idea — it is work in progress whose evidence lives on the card. Fanning it
+    out mints new ids for work that already happened, and those children then
+    re-run it (2026-09-08: t_89ebac10 became t_3365d37e / t_a06ddf52 /
+    t_4e723a61, all three later closed as "duplicated work already finished").
+
+    Deliberately narrow: only execution counts. Comments and attachments do
+    not, so a human annotating a fresh idea never blocks its decomposition.
+    Best-effort — a DB error must not stop the decomposer.
+    """
+    try:
+        with kbc.connect_closing() as conn:
+            runs = conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,),
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT started_at FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            terminal = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+                "AND kind IN ('completed', 'gave_up')", (task_id,),
+            ).fetchone()[0]
+    except Exception as exc:
+        logger.debug("decompose: prior-work check failed on %s (%s)", task_id, exc)
+        return None
+    started = row["started_at"] if row is not None else None
+    if not (runs or started or terminal):
+        return None
+    marks = []
+    if runs:
+        marks.append(f"{runs} run(s)")
+    if terminal:
+        marks.append(f"{terminal} terminal event(s)")
+    if started:
+        marks.append("started_at set")
+    return (
+        "task already has prior work (" + ", ".join(marks) + "); decomposing it "
+        "would duplicate work whose evidence is already on the card — "
+        "pass force=True (CLI: --force) to decompose anyway"
+    )
+
+
 def decompose_task(
     task_id: str,
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    force: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
-    (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
+    (not in triage, no aux client, API error, malformed/empty reply, prior work
+    on the card) surface as ``ok=False``.
+
+    ``force`` skips the prior-work guard for an operator who means it; the
+    gateway's auto-decompose path never sets it.
+    """
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    if not force:
+        blocked_reason = _prior_work_reason(task_id)
+        if blocked_reason:
+            return DecomposeOutcome(task_id, False, blocked_reason)
 
     routing = _load_routing()
     raw, reason = _call_aux(
