@@ -311,3 +311,51 @@ def test_unreadable_profile_config_fails_open(kanban_home):
         kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert len(spawns) == 1, "an unresolvable provider chain froze the board"
+
+
+# ---------------------------------------------------------------------------
+# probe.ok is NOT a usability signal (regression guard)
+# ---------------------------------------------------------------------------
+
+
+def test_failed_credential_probe_does_not_wall_a_provider(kanban_home):
+    """``probe.ok: false`` must NOT hold cards back.
+
+    Tried and reverted on 2026-09-08: the alibaba entry reports
+    ``{"ok": false, "reason": "DASHSCOPE_API_KEY not present"}`` because the
+    probe looks for an environment variable, while Hermes authenticates that
+    provider from ``auth.json``. The provider is demonstrably reachable --
+    ``zero`` (chain: alibaba-coding-plan) completed cards at 12:19, 12:23 and
+    13:10 that same day with that exact probe result, and the live plan balance
+    was fetched successfully through it.
+
+    Gating on it froze ``zero`` and ``neon`` outright. A probe failure is an
+    ambiguous signal about one credential path, not proof the provider is
+    unreachable, so it falls under the module's fail-open rule.
+    """
+    now = time.time()
+    body = {
+        "schema_version": 2,
+        "generated_at": now,
+        "providers": {
+            "alibaba_token_plan": {
+                "provider": "alibaba-coding-plan",
+                "status": "ok",
+                "probe": {"ok": False, "reason": "DASHSCOPE_API_KEY not present"},
+                "balance": {"used_percent": 78.08},
+            }
+        },
+    }
+    state = kanban_home / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "quota_snapshot.json").write_text(json.dumps(body))
+    _write_profile(kanban_home, "zero", "alibaba-coding-plan")
+    spawns, fake_spawn = _spawn_recorder()
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="zero can still work", assignee="zero")
+        kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert spawns == [tid], (
+        "a failed credential probe froze a provider that is demonstrably working"
+    )
