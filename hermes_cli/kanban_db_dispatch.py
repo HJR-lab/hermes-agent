@@ -874,14 +874,24 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection, crash_details: list, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) trip
     immediately.
+
+    ``failure_limit`` is the dispatcher's configured breaker limit — the same
+    number ``recompute_ready`` gates re-promotion on. The violation budget is
+    floored at it so a board configured above
+    ``_PROTOCOL_VIOLATION_FAILURE_LIMIT`` cannot trip here and then be
+    re-promoted there.
     """
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, _, err_text in crash_details:
@@ -895,7 +905,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 continue  # task deleted mid-loop
             task_override = _kb._row_get(trow, "max_retries")
             violation_limit = (
-                int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                int(task_override) if task_override is not None
+                else max(_PROTOCOL_VIOLATION_FAILURE_LIMIT, int(failure_limit))
             )
             if streak < violation_limit:
                 # Below budget: already back at ``ready`` with the error stamped.
@@ -934,7 +945,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -946,7 +959,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     sweep = _reclaim_dead_workers(conn)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = (
+        _account_crashes(conn, sweep.crash_details, failure_limit=failure_limit)
+        if sweep.crash_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -1060,6 +1076,15 @@ def _record_task_failure(
                 )
             return False
 
+        # A trip must be self-consistent with the breaker state it leaves
+        # behind: ``recompute_ready`` refuses to re-promote a blocked task only
+        # while ``consecutive_failures >= effective_limit``. ``force_trip``
+        # callers applied their own bounded budget (the protocol-violation
+        # streak) and would otherwise land here with a counter of 1 — the
+        # dispatcher would then promote the just-given-up task straight back to
+        # ``ready`` and spawn another doomed worker. Persist the limit the
+        # breaker actually tripped on so give-up is durable.
+        failures = max(failures, effective_limit)
         # Spawn path (release_claim) is still running and also clears claim
         # state; the timeout/crash path already did.
         conn.execute(
@@ -1638,7 +1663,7 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
