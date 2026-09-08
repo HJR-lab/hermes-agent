@@ -41,6 +41,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    automatic_general_assignees: Any
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -111,6 +112,10 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # reconciliation); false keeps orphans frozen for manual forensics.
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),
         default_assignee=default_assignee,
+        # Allow-list of assignees the dispatcher may auto-spawn. Unset means
+        # "no allow-list"; an explicit list is a containment control, so it is
+        # passed through verbatim rather than coerced to a truthy check.
+        automatic_general_assignees=kanban_cfg.get("automatic_general_assignees"),
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),

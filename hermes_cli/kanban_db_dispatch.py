@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 from typing import Any
+from typing import Iterable
 from typing import Callable
 from typing import Mapping
 from typing import Optional
@@ -1453,6 +1454,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    automatic_general_assignees: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -1476,6 +1478,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            automatic_general_assignees=automatic_general_assignees,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -1526,12 +1529,22 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    allowed_assignees: Optional[set[str]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Escalation gate + general allow-list, BEFORE any other spawn reasoning.
+    # A governed escalation row never falls through to the allow-list in either
+    # direction; see hermes_cli.kanban_escalation. Both controls were silently
+    # lost once (t_919cc864 / t_983e8288) — keep them first and keep them here.
+    from hermes_cli import kanban_escalation as _esc
+    _ok, _reason = _esc.may_auto_spawn(conn, row, assignee, allowed_assignees)
+    if not _ok:
+        result.skipped_nonspawnable.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -1785,6 +1798,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    automatic_general_assignees: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -1832,10 +1846,13 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    from hermes_cli import kanban_escalation as _esc_mod
+    _allowed_assignees = _esc_mod.normalize_general_assignees(automatic_general_assignees)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        allowed_assignees=_allowed_assignees,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
