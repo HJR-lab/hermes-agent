@@ -350,3 +350,54 @@ def test_decompose_still_fans_out_a_fresh_triage_card(kanban_home):
 
     assert outcome.ok, outcome.reason
     assert outcome.child_ids and len(outcome.child_ids) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unanchored persistent workspaces must fail at creation, not at spawn
+# ---------------------------------------------------------------------------
+
+
+def test_worktree_without_an_anchor_is_rejected_at_creation(kanban_home):
+    """t_1c89d3a6 itself: created ``--workspace worktree`` with no path on a
+    board with no ``default_workdir``, it was claimed, crashed with
+    ``spawn_failed``, and sat ``ready`` with no worker for 46 minutes. The
+    error belongs in front of whoever creates the card."""
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError) as exc:
+            kb.create_task(conn, title="stop the retry floods", workspace_kind="worktree")
+    msg = str(exc.value)
+    assert "workspace_path" in msg
+    assert "default_workdir" in msg
+
+
+def test_dir_without_a_path_is_rejected_at_creation(kanban_home):
+    """Same defect class: ``resolve_workspace`` raises for a pathless ``dir``."""
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(conn, title="pathless dir", workspace_kind="dir")
+
+
+def test_anchored_worktree_and_scratch_creation_still_work(kanban_home, tmp_path):
+    """The guard is narrow: an explicit path is fine, and ``scratch`` — which
+    resolves to a per-task board directory — is untouched."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with kbc.connect() as conn:
+        anchored = kb.create_task(
+            conn, title="anchored", workspace_kind="worktree", workspace_path=str(repo),
+        )
+        scratch = kb.create_task(conn, title="scratch task")
+        assert kb.get_task(conn, anchored).workspace_path == str(repo)
+        assert kb.get_task(conn, scratch).workspace_kind == "scratch"
+
+
+def test_board_default_workdir_still_anchors_a_pathless_worktree(kanban_home, tmp_path):
+    """When the board HAS a default_workdir the task inherits it as before —
+    the guard only fires when nothing can resolve the workspace."""
+    repo = tmp_path / "boardrepo"
+    repo.mkdir()
+    kb.write_board_metadata(None, default_workdir=str(repo))
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="inherits the board anchor", workspace_kind="worktree")
+        assert kb.get_task(conn, tid).workspace_path == str(repo)
