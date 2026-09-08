@@ -110,6 +110,16 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_provider_walled: list[tuple[str, str, str, Optional[float]]] = field(default_factory=list)
+    """``(task_id, assignee, provider, resets_at)`` held because EVERY provider
+    in the assignee's chain is out of quota. NOT a failure and NOT operator-
+    actionable — the card dispatches on its own once the window resets. Kept
+    apart from ``skipped_nonspawnable`` so health telemetry does not read a
+    provider outage as a broken board."""
+    provider_wall_notices: list[tuple[str, Optional[float]]] = field(default_factory=list)
+    """De-duplicated ``(provider, resets_at)`` for this tick. One entry per
+    walled provider no matter how many cards it held, so an outage produces one
+    board-level notice rather than one per card."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1251,6 +1261,17 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     return profile_exists
 
 
+def _walled_provider_fn() -> Optional[Callable[[str], object]]:
+    """``kanban_provider_gate.walled_provider_for``, or ``None`` when it cannot
+    be imported (local import avoids a cycle; callers fall back to dispatching,
+    which is the fail-open behaviour the gate itself guarantees)."""
+    try:
+        from hermes_cli.kanban_provider_gate import walled_provider_for
+    except Exception:
+        return None
+    return walled_provider_for
+
+
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
@@ -1540,6 +1561,26 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
+    # Provider wall: when EVERY provider in this assignee's chain is out of
+    # quota, a spawn can only produce a 429 -> rc=0 -> "protocol violation" and
+    # burn the card's retry budget for something that is not the card's fault
+    # (2026-09-08: 128 such runs, 28 cards falsely blocked). Hold the card
+    # instead; it dispatches on a later tick once the window resets. Fails open
+    # on every unknown, so a broken quota monitor cannot freeze the board.
+    walled_provider_for = _walled_provider_fn()
+    if walled_provider_for is not None:
+        try:
+            wall = walled_provider_for(assignee)
+        except Exception:
+            wall = None
+        if wall is not None:
+            result.skipped_provider_walled.append(
+                (task_id, assignee, wall.provider, wall.resets_at)
+            )
+            notice = (wall.provider, wall.resets_at)
+            if notice not in result.provider_wall_notices:
+                result.provider_wall_notices.append(notice)
+            return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
