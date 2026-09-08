@@ -731,18 +731,44 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
             print("  Then re-run the update. Local work is untouched.")
             sys.exit(1)
         return
-    # Same branch: a true upstream force-push/rebase; local changes are stashed, so reset.
-    # Orphan divergence (no common ancestor: corrupted HEAD, re-init) would lose the whole
-    # local graph, so park pre_pull_sha behind a rescue ref first.
+    # Same branch: an upstream force-push/rebase, OR simply local commits sitting on
+    # this branch. ``reset --hard`` destroys both, so park pre_pull_sha behind a rescue
+    # ref whenever there is anything to lose.
+    #
+    # Two ways to lose work here, and only the first used to be covered:
+    #   1. Orphan divergence (no common ancestor: corrupted HEAD, re-init) — the whole
+    #      local graph goes.
+    #   2. This branch is simply AHEAD of origin/<branch>. A common ancestor exists, so
+    #      the old guard stayed silent, and every local commit went to the reflog only —
+    #      unreachable from any ref and on git's gc clock. That is not hypothetical: it
+    #      destroyed four committed kanban fixes, and separately the in-repo half of the
+    #      escalation guard and the routing allow-list, whose config survived outside the
+    #      repo so both controls read as active while enforcing nothing (kanban
+    #      t_05f9f4be, t_919cc864, t_983e8288, t_acefc80c).
     merge_base_result = _git_run(git_cmd, ["merge-base", "HEAD", f"origin/{branch}"])
     has_common_ancestor = merge_base_result.returncode == 0 and merge_base_result.stdout.strip()
-    if not has_common_ancestor and pre_pull_sha:
+    local_only = _git_run(git_cmd, ["rev-list", "--count", f"origin/{branch}..HEAD"])
+    try:
+        local_only_count = int((local_only.stdout or "0").strip() or 0)
+    except ValueError:
+        # Unparseable: assume there IS work to lose. A needless backup ref is free;
+        # a skipped one is not recoverable.
+        local_only_count = 1
+    if (not has_common_ancestor or local_only_count) and pre_pull_sha:
         from datetime import datetime as _dt, timezone
         # SHA suffix so two updates in the same second get distinct refs.
+        kind = "orphan" if not has_common_ancestor else "ahead"
         rescue_ref = (
-            f"refs/hermes-update-backups/orphan-{branch}-"
+            f"refs/hermes-update-backups/{kind}-{branch}-"
             f"{_dt.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{pre_pull_sha[:12]}")
-        head = f"  ⚠ Local history shares no common ancestor with origin/{branch} (orphan divergence) — "
+        if not has_common_ancestor:
+            head = (
+                f"  ⚠ Local history shares no common ancestor with origin/{branch} "
+                f"(orphan divergence) — ")
+        else:
+            head = (
+                f"  ⚠ {local_only_count} local commit(s) on '{branch}' are not on "
+                f"origin/{branch} and would be destroyed by the reset — ")
         if _git_run(git_cmd, ["update-ref", rescue_ref, pre_pull_sha]).returncode == 0:
             print(
                 f"{head}backed up current HEAD to {rescue_ref} before resetting. "
