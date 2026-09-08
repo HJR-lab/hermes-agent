@@ -103,15 +103,6 @@ def _entry_state(entry: dict) -> _ProviderState:
     """
     resets_at: Optional[float] = None
     walled = str(entry.get("status") or "").strip().lower() == "exhausted"
-    # A provider with no usable credentials cannot absorb work no matter what
-    # its plan balance says. On 2026-09-08 the alibaba fallback reported plan
-    # status 'ok' at 78% used while its probe said "DASHSCOPE_API_KEY not
-    # present" -- treating that as a healthy link would have let the whole deus
-    # queue flood into an unreachable fallback. Only an EXPLICIT ok=False
-    # counts; a missing probe block stays an unknown and fails open.
-    probe = entry.get("probe")
-    if isinstance(probe, dict) and probe.get("ok") is False:
-        walled = True
     limits = entry.get("rate_limits")
     if isinstance(limits, dict):
         for key in ("primary", "secondary"):
