@@ -311,3 +311,94 @@ def test_unreadable_profile_config_fails_open(kanban_home):
         kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert len(spawns) == 1, "an unresolvable provider chain froze the board"
+
+
+# ---------------------------------------------------------------------------
+# A link that cannot be used is not a healthy link
+# ---------------------------------------------------------------------------
+
+
+def _write_snapshot_with_probe(home: Path, providers: dict) -> None:
+    """``providers`` maps key -> (provider, used_percent, status, probe_ok)."""
+    now = time.time()
+    body = {"schema_version": 2, "generated_at": now, "providers": {}}
+    for key, (provider, used_percent, status, probe_ok) in providers.items():
+        entry = {
+            "provider": provider,
+            "status": status,
+            "rate_limits": {
+                "primary": {
+                    "used_percent": used_percent,
+                    "window_minutes": 300.0,
+                    "resets_at": now + 3600,
+                }
+            },
+        }
+        if probe_ok is not None:
+            entry["probe"] = {"ok": probe_ok, "reason": "DASHSCOPE_API_KEY not present"}
+        body["providers"][key] = entry
+    state = home / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "quota_snapshot.json").write_text(json.dumps(body))
+
+
+def test_fallback_with_failed_probe_is_not_a_usable_link(kanban_home):
+    """The live deus chain on 2026-09-08: Codex walled, and the alibaba
+    fallback reports plan status 'ok' while its probe says the API key is not
+    present. A provider with no credentials cannot absorb the work, so the
+    chain is effectively walled and the card must be held."""
+    _write_profile(kanban_home, "deus", "openai-codex", fallbacks=["alibaba-coding-plan"])
+    _write_snapshot_with_probe(
+        kanban_home,
+        {
+            "codex": ("openai-codex", 100, "exhausted", None),
+            "alibaba_token_plan": ("alibaba-coding-plan", 12, "ok", False),
+        },
+    )
+    spawns, fake_spawn = _spawn_recorder()
+
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="deus card", assignee="deus")
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert spawns == [], (
+        "dispatched into a chain whose only fallback has no credentials"
+    )
+    assert res.skipped_provider_walled
+
+
+def test_passing_probe_keeps_the_fallback_usable(kanban_home):
+    _write_profile(kanban_home, "deus", "openai-codex", fallbacks=["alibaba-coding-plan"])
+    _write_snapshot_with_probe(
+        kanban_home,
+        {
+            "codex": ("openai-codex", 100, "exhausted", None),
+            "alibaba_token_plan": ("alibaba-coding-plan", 12, "ok", True),
+        },
+    )
+    spawns, fake_spawn = _spawn_recorder()
+
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="deus card", assignee="deus")
+        kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert len(spawns) == 1, "a healthy, credentialed fallback must keep working"
+
+
+def test_absent_probe_is_not_treated_as_unusable(kanban_home):
+    """Fail open: no probe block is an unknown, not a failure."""
+    _write_profile(kanban_home, "deus", "openai-codex", fallbacks=["alibaba-coding-plan"])
+    _write_snapshot_with_probe(
+        kanban_home,
+        {
+            "codex": ("openai-codex", 100, "exhausted", None),
+            "alibaba_token_plan": ("alibaba-coding-plan", 12, "ok", None),
+        },
+    )
+    spawns, fake_spawn = _spawn_recorder()
+
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="deus card", assignee="deus")
+        kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert len(spawns) == 1, "a missing probe block was read as a failed probe"
