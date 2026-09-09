@@ -55,6 +55,12 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The dispatcher's OWN quota-wall requeue wording. Matched so it is never mistaken
+# for evidence of a broken card — that requeue explicitly counts no failure.
+_QUOTA_REQUEUE_TEXT_RE = re.compile(
+    r"exited rate-limited \(quota wall\)", re.IGNORECASE,
+)
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -1172,8 +1178,15 @@ def check_respawn_guard(
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
+    #    EXCEPT the dispatcher's own quota-wall requeue text. That path exists to
+    #    say "not the card's fault, no failure counted", yet its wording ("exited
+    #    rate-limited (quota wall)") matches _RESPAWN_BLOCKER_RE. While the newest
+    #    run is still ``rate_limited`` the early return above hides that; as soon
+    #    as any later run supersedes it the card would be parked forever, long
+    #    after quota returned. Observed live 2026-09-09 on seven duex review cards
+    #    with Codex at 0% of its 5h window.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    if err and not _QUOTA_REQUEUE_TEXT_RE.search(err) and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
