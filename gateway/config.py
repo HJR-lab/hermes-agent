@@ -13,6 +13,7 @@ from enum import Enum
 
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+from gateway.room_handoffs import parse_room_handoff_routes, routes_to_dict
 from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
@@ -563,6 +564,9 @@ class GatewayConfig:
     # Public HTTPS endpoint for scoped RoomLink calls (an API key alone must never advertise a
     # route); HERMES_ROOM_LINK_URL overrides.
     room_link_url: Optional[str] = None
+    # Opt-in local reply mirrors for two profiles sharing a Telegram room. These are injected as
+    # per-turn sidecar context, never as synthetic user/platform messages.
+    room_handoffs: list = field(default_factory=list)
     systemd_watchdog_seconds: int = 0  # opt-in; zero keeps Type=simple and disables sd_notify
     # In-process loop liveness watchdog: after consecutive missed probes it dumps all-thread stacks
     # and hard-exits with the service-restart code. The knobs tolerate transient self-recovering
@@ -653,6 +657,7 @@ class GatewayConfig:
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
+            "room_handoffs": routes_to_dict(self.room_handoffs),
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -733,6 +738,7 @@ class GatewayConfig:
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             multiplex_profile_allowlist=pick("multiplex_profile_allowlist"),
             room_link_url=room_link_url if isinstance(room_link_url, str) else None,
+            room_handoffs=parse_room_handoff_routes(pick("room_handoffs") or []),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=_coerce_bool(pick("loop_watchdog"), True),
             loop_watchdog_probe_interval_s=bounded_float("loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S, 1.0, 3600.0),
