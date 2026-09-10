@@ -9,17 +9,33 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import queue
 import re
 import subprocess
 import threading
+import tomllib
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from tools.environments.local import hermes_subprocess_env
 
+logger = logging.getLogger(__name__)
+
 MIN_CODEX_VERSION = (0, 125, 0)
+
+
+def _codex_config_defines_mcp_server(codex_home: Optional[str], name: str) -> bool:
+    """True when ``<CODEX_HOME>/config.toml`` has ``[mcp_servers.<name>]`` with a stdio or http transport."""
+    path = os.path.join(codex_home or os.path.expanduser("~/.codex"), "config.toml")
+    try:
+        with open(path, "rb") as fh:
+            server = (tomllib.load(fh).get("mcp_servers") or {}).get(name)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return isinstance(server, dict) and bool(server.get("command") or server.get("url"))
 
 
 @dataclass
@@ -72,10 +88,18 @@ class CodexAppServerClient:
         # environment, never by granting the whole executor process ownership.
         owned_task = os.environ.get("HERMES_KANBAN_TASK") and is_dispatcher_owned_worker_context()
         if owned_task:
-            for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
-                if key in os.environ:
-                    cmd += ["-c", f"mcp_servers.hermes-mcp.env.{key}={json.dumps(os.environ[key])}"]
-            cmd += ["-c", f'mcp_servers.hermes-mcp.env.{DELEGATED_CHILD_ENV_MARKER}=""']
+            server = HERMES_TOOLS_MCP_SERVER_NAME
+            # An env override against a server config.toml does not define synthesises an env-only
+            # table, and codex refuses to start ("invalid transport"). Scope only a registered server.
+            if _codex_config_defines_mcp_server(spawn_env.get("CODEX_HOME"), server):
+                for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+                    if key in os.environ:
+                        cmd += ["-c", f"mcp_servers.{server}.env.{key}={json.dumps(os.environ[key])}"]
+                cmd += ["-c", f'mcp_servers.{server}.env.{DELEGATED_CHILD_ENV_MARKER}=""']
+            else:
+                logger.warning(
+                    "codex config.toml has no [mcp_servers.%s]; this Kanban worker has no Hermes tools. "
+                    "Register it with `/codex-runtime codex_app_server`.", server)
         spawn_env = delegated_child_subprocess_env(spawn_env)
         # Kanban workers must write handoff/status to the board DB outside the
         # workspace: keep the sandbox on, add the Kanban root as writable.

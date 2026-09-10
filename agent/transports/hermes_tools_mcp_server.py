@@ -16,6 +16,11 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# The ``[mcp_servers.<name>]`` table migrate() registers AND the table the app-server transport scopes
+# with per-worker ``-c mcp_servers.<name>.env.*`` overrides. One constant so the writer and the reader
+# cannot drift: a mismatch synthesises an env-only table codex rejects as "invalid transport".
+HERMES_TOOLS_MCP_SERVER_NAME = "hermes-tools"
+
 # JSON Schema type -> Python type mapping for signature generation
 _JSON_TO_PY = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
 
@@ -63,7 +68,7 @@ def _build_server() -> Any:
     from model_tools import get_tool_definitions, handle_function_call
 
     mcp = MCPServer(
-        "hermes-tools",
+        HERMES_TOOLS_MCP_SERVER_NAME,
         instructions=(
             "Hermes Agent's tool surface, exposed for use inside a Codex "
             "session. Use these for capabilities Codex's built-in toolset "
