@@ -265,6 +265,80 @@ class TestSpawnEnvIsolation:
         assert all("danger" not in part for part in cmd)
 
 
+class TestKanbanScopeTargetsRegisteredMcpServer:
+    """The per-worker ``-c mcp_servers.<name>.env.*`` scope overrides must name the server migrate()
+    registers. The transport once said "hermes-mcp" while migrate wrote "hermes-tools": the override
+    synthesised an env-only table, codex refused to start ("invalid transport"), and every
+    dispatcher-owned codex worker died at initialize."""
+
+    @staticmethod
+    def _spawn_cmd(monkeypatch, codex_home):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(codex_home / "kanban.db"))
+
+        client = cas.CodexAppServerClient(codex_bin="codex", codex_home=str(codex_home))
+        client._closed = True
+        return captured["cmd"]
+
+    @staticmethod
+    def _scoped_servers(cmd):
+        overrides = [cmd[i + 1] for i, part in enumerate(cmd[:-1]) if part == "-c"]
+        return {o.split(".", 2)[1] for o in overrides if o.startswith("mcp_servers.")}
+
+    def test_overrides_name_the_server_migrate_registers(self, monkeypatch, tmp_path):
+        import tomllib
+        from hermes_cli.codex_runtime_plugin_migration import migrate
+
+        report = migrate({}, codex_home=tmp_path, discover_plugins=False,
+                         default_permission_profile=None)
+        assert report.written, report.errors
+        servers = tomllib.loads((tmp_path / "config.toml").read_text())["mcp_servers"]
+
+        scoped = self._scoped_servers(self._spawn_cmd(monkeypatch, tmp_path))
+
+        assert scoped, "an owned Kanban worker must scope the Hermes tools MCP server"
+        for name in scoped:
+            assert name in servers, f"-c override targets unregistered [mcp_servers.{name}]"
+            assert servers[name].get("command"), f"[mcp_servers.{name}] has no transport"
+
+    def test_no_scope_overrides_when_server_unregistered(self, monkeypatch, tmp_path):
+        (tmp_path / "config.toml").write_text('[mcp_servers.context7]\ncommand = "npx"\n')
+
+        cmd = self._spawn_cmd(monkeypatch, tmp_path)
+
+        assert not self._scoped_servers(cmd)
+        assert 'sandbox_mode="workspace-write"' in cmd
+
+
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
     inherit_credentials=True) instead of a raw os.environ.copy().
