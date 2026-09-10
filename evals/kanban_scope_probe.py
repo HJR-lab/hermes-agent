@@ -17,6 +17,7 @@ sys.path.insert(0, str(repo))
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 from agent.transports.codex_app_server import CodexAppServerClient
+from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME as SERVER
 
 home = Path(os.environ["HOME"])
 hh = Path(os.environ["HERMES_HOME"])
@@ -34,8 +35,8 @@ ch.mkdir()
 (ch / "config.toml").write_text(
     'model="fixture"\nmodel_provider="fixture"\n'
     '[model_providers.fixture]\nname="fixture"\nbase_url="http://127.0.0.1:9/v1"\nwire_api="responses"\n'
-    '[mcp_servers.hermes-mcp]\ncommand=' + json.dumps(sys.executable) + '\nargs=["-m","agent.transports.hermes_tools_mcp_server"]\nstartup_timeout_sec=40\n'
-    '[mcp_servers.hermes-mcp.env]\nPYTHONPATH=' + json.dumps(str(repo)) + '\nHERMES_HOME=' + json.dumps(str(hh)) + '\n'
+    f'[mcp_servers.{SERVER}]\ncommand=' + json.dumps(sys.executable) + '\nargs=["-m","agent.transports.hermes_tools_mcp_server"]\nstartup_timeout_sec=40\n'
+    f'[mcp_servers.{SERVER}.env]\nPYTHONPATH=' + json.dumps(str(repo)) + '\nHERMES_HOME=' + json.dumps(str(hh)) + '\n'
 )
 report = {}
 with CodexAppServerClient(codex_bin=shutil.which("codex") or "codex", codex_home=str(ch)) as c:
@@ -51,7 +52,7 @@ with CodexAppServerClient(codex_bin=shutil.which("codex") or "codex", codex_home
     status = c.request("mcpServerStatus/list", {"threadId": thread_id}, timeout=50)
     report["mcp_servers"] = [{"name": x.get("name"), "tools": list(x.get("tools", {}))} for x in status.get("data", [])]
     for name, tid in (("foreign", foreign), ("own", own)):
-        report[name] = c.request("mcpServer/tool/call", {"threadId": thread_id, "server": "hermes-mcp", "tool": "kanban_complete", "arguments": {"task_id": tid, "summary": "supervised parent handoff"}}, timeout=50)
+        report[name] = c.request("mcpServer/tool/call", {"threadId": thread_id, "server": SERVER, "tool": "kanban_complete", "arguments": {"task_id": tid, "summary": "supervised parent handoff"}}, timeout=50)
     report["stderr"] = c._stderr_lines[-8:]
 report["readback"] = {"own": kb.get_task(conn, own).status, "foreign": kb.get_task(conn, foreign).status, "integrity": conn.execute("PRAGMA integrity_check").fetchone()[0]}
 print(json.dumps(report, indent=2))
