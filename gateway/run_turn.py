@@ -1878,6 +1878,29 @@ class GatewayTurnMixin:
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes)
 
+        # Telegram never fan-outs bot-authored messages to another bot in the same room. Pull the
+        # peer profile's locally mirrored replies into this turn's user-message sidecar; this keeps
+        # strict role alternation and leaves the persisted human message untouched.
+        _room_handoff_routes = getattr(getattr(self, "config", None), "room_handoffs", None)
+        if source.platform == Platform.TELEGRAM and _room_handoff_routes:
+            _room_handoff_target = "unresolved"
+            try:
+                from gateway.room_handoffs import consume_pending, effective_profile_name
+
+                _room_handoff_target = effective_profile_name(getattr(source, "profile", None))
+                turn_sidecar_notes.extend(await asyncio.to_thread(
+                    consume_pending,
+                    _room_handoff_routes,
+                    platform="telegram",
+                    chat_id=str(source.chat_id or ""),
+                    target_profile=_room_handoff_target,
+                ))
+            except Exception:
+                logger.exception(
+                    "Room handoff consume failed: platform=telegram chat=%s target=%s",
+                    source.chat_id or "?", _room_handoff_target,
+                )
+
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).
         _vc_note = self._voice_channel_sidecar_note(event, source, session_key)
@@ -2004,6 +2027,34 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            # Mirror only completed, externally-triggered Telegram replies. The inbound Telegram
+            # message id is the stable source-turn id across retries; the ledger's UNIQUE key makes
+            # a replay idempotent even if the platform delivery itself is retried.
+            _room_handoff_routes = getattr(getattr(self, "config", None), "room_handoffs", None)
+            if (
+                source.platform == Platform.TELEGRAM and _room_handoff_routes and event.message_id
+                and response and not _intentional_silence and not agent_failed_early
+                and not hidden_reasoning_incomplete and not is_context_overflow_failure
+            ):
+                try:
+                    from gateway.room_handoffs import effective_profile_name, publish_reply
+
+                    _room_handoff_source = effective_profile_name(getattr(source, "profile", None))
+                    await asyncio.to_thread(
+                        publish_reply,
+                        _room_handoff_routes,
+                        platform="telegram",
+                        chat_id=str(source.chat_id or ""),
+                        message_id=str(event.message_id),
+                        source_profile=_room_handoff_source,
+                        content=response,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Room handoff publish failed: platform=telegram chat=%s message=%s source=%s",
+                        source.chat_id or "?", event.message_id,
+                        getattr(source, "profile", None) or "default",
+                    )
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,

@@ -1884,6 +1884,10 @@ DEFAULT_CONFIG = {
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         # Named-profile allowlist for multiplex mode. None = serve all; [] = default only.
         "multiplex_profile_allowlist": None,
+        # Local, restart-safe reply mirrors for two profiles whose Telegram bots share a room.
+        # Entries: {platform: telegram, chat_id: "-100...", profiles: [default, specialist]}.
+        # Mirrored replies arrive as provenance-labelled per-turn context, never as user messages.
+        "room_handoffs": [],
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,
