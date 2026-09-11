@@ -679,6 +679,51 @@ def _repair_current_checkout(
     return current_checkout_complete
 
 
+def _rescue_local_only_commits(git_cmd, branch: str) -> "Optional[str]":
+    """Park commits on HEAD that ``origin/<branch>`` does not contain onto a rescue branch.
+
+    Returns the rescue branch name, or ``None`` when there was nothing to rescue (the
+    common case: a checkout that is merely behind, or a genuine upstream force-push with
+    no local work). Never raises and never blocks the update -- losing the ability to
+    update would be its own outage -- but it must never stay silent either: if the rescue
+    cannot be created, the operator is told what is about to be lost and where to find it.
+    """
+    count_result = _git_run(git_cmd, ["rev-list", "--count", f"origin/{branch}..HEAD"])
+    if count_result.returncode != 0:
+        return None
+    try:
+        local_only = int((count_result.stdout or "0").strip() or 0)
+    except ValueError:
+        return None
+    if local_only <= 0:
+        return None
+
+    head_sha = (_git_run(git_cmd, ["rev-parse", "HEAD"]).stdout or "").strip()
+    subjects = (_git_run(
+        git_cmd, ["log", "--oneline", "--no-decorate", f"origin/{branch}..HEAD"]).stdout or "").strip()
+
+    rescue_branch = (
+        f"hermes-update-rescue/{branch}-"
+        f"{_time.strftime('%Y%m%d-%H%M%S')}-{head_sha[:12]}")
+    plural = "" if local_only == 1 else "s"
+    print(
+        f"  ⚠ This checkout has {local_only} local commit{plural} that origin/{branch} "
+        f"does not contain. Resetting would destroy {'it' if local_only == 1 else 'them'}.")
+    for line in subjects.splitlines():
+        print(f"      {line}")
+    if _git_run(git_cmd, ["branch", rescue_branch, head_sha]).returncode == 0:
+        print(f"  ✓ Saved to branch '{rescue_branch}' before resetting.")
+        print(f"    Review with: git log {rescue_branch}")
+        print(f"    Re-apply with: git cherry-pick {branch}..{rescue_branch}")
+        return rescue_branch
+    # Branch creation failed: never claim a rescue that does not exist.
+    print(
+        f"  ✗ Could not create rescue branch '{rescue_branch}'. The commits above are "
+        f"about to become reflog-only.")
+    print(f"    Recover them with: git branch <name> {head_sha}")
+    return None
+
+
 def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
     """Fast-forward failed: merge on a custom branch (local commits survive) or reset --hard on the
     same branch (rescue ref first when histories share no ancestor). ``sys.exit(1)`` on failure."""
@@ -699,6 +744,15 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
             sys.exit(1)
         return
     # Same branch: a true upstream force-push/rebase; local changes are stashed, so reset.
+    #
+    # But "diverged on the same branch" ALSO covers the case where this checkout simply
+    # carries local commits that were never pushed. A reset --hard would destroy them
+    # outright: they become reachable only from the reflog, unreachable from any ref and
+    # on git's gc clock. That has cost real work here more than once, including fixes that
+    # were fully committed -- committing is necessary but not sufficient. So before any
+    # reset, park local-only commits on a real BRANCH (refs/heads/..., visible in
+    # `git branch`) and say so loudly. A ref the operator cannot see is not a rescue.
+    _rescue_local_only_commits(git_cmd, branch)
     # Orphan divergence (no common ancestor: corrupted HEAD, re-init) would lose the whole
     # local graph, so park pre_pull_sha behind a rescue ref first.
     merge_base_result = _git_run(git_cmd, ["merge-base", "HEAD", f"origin/{branch}"])
