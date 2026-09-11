@@ -458,6 +458,11 @@ class CLIChatTurnMixin:
         time.sleep(0.15)
         if turn.result:
             self.conversation_history = turn.result.get("messages", self.conversation_history)
+        # Keep the terminal turn result reachable after chat() returns: chat()
+        # yields only the response string, but the single-query caller needs the
+        # classified failure to pick a kanban worker exit code (a quota wall must
+        # exit 75, not 0 — see hermes_cli.kanban_worker_exit).
+        self.last_turn_result = turn.result
         # Mid-turn auto-compression continues in a child session: sync so /status, /resume,
         # titling and the exit summary target the live child, not the ended parent.
         if (self.agent and getattr(self.agent, "session_id", None)

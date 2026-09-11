@@ -41,7 +41,12 @@ def _git_stdout(git_cmd, args, cwd, **kw) -> Optional[str]:
 def _prune_orphan_rescue_refs(
     git_cmd, cwd, branch, keep=_ORPHAN_RESCUE_REFS_TO_KEEP, max_age_days=_ORPHAN_RESCUE_REF_MAX_AGE_DAYS
 ) -> None:
-    """Expire old orphan rescue refs (``refs/hermes-update-backups/orphan-<branch>-<ts>-<sha>``).
+    """Expire old update rescue refs under ``refs/hermes-update-backups/``.
+
+    Covers both kinds written by ``_reconcile_diverged_checkout``:
+    ``orphan-<branch>-<ts>-<sha>`` (no common ancestor) and ``ahead-<branch>-<ts>-<sha>``
+    (local commits the reset would have destroyed). Both must be pruned or a repeatedly
+    diverging install grows ``.git`` without bound.
 
     Each ref pins a possibly multi-GB snapshot against ``git gc``, so a repeatedly corrupted install would
     grow ``.git`` unbounded. Keep the ``keep`` newest AND drop any older than ``max_age_days`` by the
@@ -54,17 +59,34 @@ def _prune_orphan_rescue_refs(
     """
     from hermes_cli.update_cmd import _git_run
     with suppress(OSError):
-        prefix = f"refs/hermes-update-backups/orphan-{branch}-"
-        list_result = _git_run(git_cmd, ["for-each-ref", "--format=%(refname)", "--sort=refname", f"{prefix}*"], cwd)
-        if list_result.returncode != 0:
-            return
-        refs = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
-        stale = set(refs[:-keep] if keep > 0 else refs)
-        if max_age_days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            if max_age_days > 0 else None
+        )
+        stale: set[str] = set()
+        # Each kind is pruned against its OWN keep-window. Pooling them would let a
+        # burst of one evict the other, and an ``ahead-`` ref is the last pointer to
+        # local commits the reset destroyed.
+        for kind in ("orphan", "ahead"):
+            prefix = f"refs/hermes-update-backups/{kind}-{branch}-"
+            list_result = _git_run(
+                git_cmd,
+                ["for-each-ref", "--format=%(refname)", "--sort=refname", f"{prefix}*"],
+                cwd,
+            )
+            if list_result.returncode != 0:
+                continue
+            # Names sort chronologically, so for-each-ref order is creation order.
+            refs = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
+            stale.update(refs[:-keep] if keep > 0 else refs)
+            if cutoff is None:
+                continue
             for ref in refs:
                 with suppress(ValueError):
-                    if datetime.strptime(ref[len(prefix):][:15], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc) < cutoff:
+                    stamp = ref[len(prefix):][:15]
+                    if datetime.strptime(stamp, "%Y%m%d-%H%M%S").replace(
+                        tzinfo=timezone.utc
+                    ) < cutoff:
                         stale.add(ref)
         for ref in sorted(stale):
             _git_run(git_cmd, ["update-ref", "-d", ref], cwd)
