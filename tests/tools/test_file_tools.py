@@ -57,6 +57,35 @@ class TestReadFileHandler:
         assert "error" in result
         assert "terminal not available" in result["error"]
 
+    def test_registry_refuses_sibling_document_before_extraction(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "fake-hermes"
+        active_home = root / "profiles" / "active"
+        sibling_document = root / "profiles" / "sibling" / "private.pdf"
+        active_home.mkdir(parents=True)
+        sibling_document.parent.mkdir(parents=True)
+        sibling_document.write_bytes(b"not real document content")
+
+        import agent.file_safety as file_safety
+        import tools.file_tools as file_tools
+        from tools.registry import registry
+
+        monkeypatch.setattr(file_safety, "_hermes_root_path", lambda: root)
+        monkeypatch.setattr(file_safety, "_hermes_home_path", lambda: active_home)
+        extractor = MagicMock(side_effect=AssertionError("extractor must not run"))
+        monkeypatch.setattr(file_tools, "_read_extracted_document", extractor)
+
+        entry = registry.get_entry("read_file")
+        assert entry is not None
+        result = json.loads(
+            entry.handler({"path": str(sibling_document)}, task_id="boundary-test")
+        )
+
+        assert result["error"]
+        assert "another Hermes profile" in result["error"]
+        extractor.assert_not_called()
+
 
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")
