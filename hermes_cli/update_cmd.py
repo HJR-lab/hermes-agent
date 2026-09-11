@@ -778,6 +778,21 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
             print(
                 f"{head}attempted to back up current HEAD to {rescue_ref} before resetting, "
                 f"but the backup write failed (pre-reset SHA was {pre_pull_sha}).")
+        # A backup ref under refs/hermes-update-backups/ satisfies "not reflog-only",
+        # but it does not appear in `git branch` and an operator who does not know the
+        # namespace will never find it. When there are local commits specifically, also
+        # publish a real branch: a rescue nobody can see is not a rescue (t_05f9f4be).
+        if has_common_ancestor and local_only_count:
+            rescue_branch = (
+                f"hermes-update-rescue/{branch}-"
+                f"{_dt.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{pre_pull_sha[:12]}")
+            if _git_run(git_cmd, ["branch", rescue_branch, pre_pull_sha]).returncode == 0:
+                print(f"    Also on branch '{rescue_branch}' (visible in `git branch`).")
+                print(f"    Re-apply with: git cherry-pick {branch}..{rescue_branch}")
+            else:
+                print(
+                    f"    Could not also publish branch '{rescue_branch}'; "
+                    f"recover manually with: git branch <name> {pre_pull_sha}")
         _prune_orphan_rescue_refs(git_cmd, _m().PROJECT_ROOT, branch)
     print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
     reset_result = _git_run(git_cmd, ["reset", "--hard", f"origin/{branch}"])
