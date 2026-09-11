@@ -132,7 +132,14 @@ def _assert_not_delegated_child_mutation() -> None:
     except Exception:
         delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
     if delegated:
-        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
+        raise PermissionError(
+            "delegate_task child contexts cannot mutate Kanban tasks or boards "
+            "directly. This is not a dead end: use the kanban_* MCP tools "
+            "(kanban_complete, kanban_block, kanban_comment), which run in the "
+            "gateway process and are the supported way to report results from a "
+            "dispatched worker. Do not exit without a terminal kanban call - a run "
+            "that ends without one is recorded as a crash even if the work succeeded."
+        )
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
