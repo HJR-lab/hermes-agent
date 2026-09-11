@@ -217,6 +217,57 @@ _READ_DENIED_DIRS = (
      "is inside the Hermes credential vault (encrypted secrets + local key) and cannot be read directly (browser_vault_fill resolves them server-side)."),
 )
 
+# The default profile's private memory/session stores. Named profiles may use
+# their own copies, but generic file reads must not cross into these root-lane
+# stores. SQLite sidecars carry the same private data as their primary DB.
+_ROOT_PRIVATE_READ_DIRS = ("memories", "sessions", "byterover", "hindsight")
+_ROOT_PRIVATE_READ_DATABASES = ("state.db", "memory_store.db", "retaindb_queue.db")
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _is_database_or_sidecar(path: Path, database: Path) -> bool:
+    """Whether *path* is *database* or one of its SQLite sidecars."""
+    return path == database or (
+        path.parent == database.parent
+        and any(path.name == database.name + suffix for suffix in _SQLITE_SIDECAR_SUFFIXES)
+    )
+
+
+def _profile_read_block_reason(resolved: Path) -> Optional[str]:
+    """Return the cross-profile/escalation-key denial reason for *resolved*."""
+    root = _hermes_root_path().resolve()
+    active_path = _hermes_home_path().expanduser()
+    active_home = active_path.resolve()
+    profiles_root = (root / "profiles").resolve()
+
+    # The escalation command loads signing keys through its own bounded internal
+    # path. Generic file tools never need key bytes, including the caller's own.
+    if _is_under(resolved, (root / "escalation" / "keys").resolve()):
+        return "is inside the Hermes escalation signing-key directory and cannot be read directly."
+
+    if active_home == root:
+        if _is_under(resolved, profiles_root):
+            return "is inside a named Hermes profile and cannot be read from the default profile."
+        return None
+
+    # Only the canonical <root>/profiles/<name> shape denotes a named profile.
+    # Compare the declared path's parent before dereferencing the profile home
+    # itself, so a profile-home symlink cannot erase the caller's identity.
+    if active_path.parent.resolve() != profiles_root:
+        return None
+
+    if _is_under(resolved, profiles_root) and not _is_under(resolved, active_home):
+        return "is inside another Hermes profile and cannot be read directly."
+
+    if any(_is_under(resolved, (root / dirname).resolve()) for dirname in _ROOT_PRIVATE_READ_DIRS):
+        return "is private memory/session state owned by the default Hermes profile."
+    if any(
+        _is_database_or_sidecar(resolved, (root / filename).resolve())
+        for filename in _ROOT_PRIVATE_READ_DATABASES
+    ):
+        return "is private memory/session state owned by the default Hermes profile."
+    return None
+
 
 def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
@@ -232,8 +283,10 @@ def get_read_block_error(path: str) -> Optional[str]:
     """
     resolved = Path(path).expanduser().resolve()
     hermes_dirs = _hermes_dirs()
-    reason = None
-    if any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
+    reason = _profile_read_block_reason(resolved)
+    if reason is not None:
+        reason += _DID_SUFFIX
+    elif any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
         reason = (
             "is an internal Hermes cache file and cannot be read directly to prevent "
             "prompt injection. Use the skills_list or skill_view tools instead."
