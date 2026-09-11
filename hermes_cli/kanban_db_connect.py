@@ -664,6 +664,83 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
+# ── Kanban live-board write guard ───────────────────────────────────────────
+# Companion to hermes_state's state.db guard, and deliberately built the same
+# way: IN THE SOURCE at the single choke point, activated by test context.
+#
+# This used to live in tests/conftest.py as an autouse fixture that
+# monkeypatched ``connect``, but that guard could silently disable itself. It
+# probed ``sys.modules`` and bailed when it saw this module mid-import — its
+# own docstring admitted the flake. A guard that no-ops under a race is not a
+# guard: a full-suite run on 2026-09-06 created three real cards on the
+# operator's live board (t_3de5019b, t_1d61b517, t_b3488662), each with a real
+# workspace directory, because the fixture happened to bail that round. The
+# same file set passed and failed across consecutive runs.
+#
+# Here there is no import-order window: any caller reaching connect() is
+# checked. Because it keys off test context rather than a fixture, it also
+# covers subprocess children that import this module directly.
+_KANBAN_GUARD_BYPASS_ENV = "HERMES_KANBAN_GUARD_BYPASS"
+
+
+def _real_kanban_root() -> Optional[Path]:
+    """The operator's REAL kanban root, from the pre-sandbox environment.
+
+    ``tests/conftest`` snapshots the environment before it rewires
+    ``HERMES_HOME``; prefer that so the deny-list keeps pointing at the true
+    root rather than the sandbox tempdir now sitting in os.environ.
+    """
+    try:
+        import sys as _sys
+        _ct = _sys.modules.get("tests.conftest")
+        root = getattr(_ct, "_REAL_KANBAN_ROOT", None) if _ct is not None else None
+        if root is not None:
+            return Path(root).expanduser().resolve()
+    except Exception:
+        pass
+    try:
+        return (Path.home() / ".hermes").resolve()
+    except Exception:
+        return None
+
+
+def _ensure_kanban_test_isolation(path) -> None:
+    """Refuse, under pytest, any kanban DB path inside the REAL kanban root.
+
+    Fails CLOSED on the decision that matters (a resolved production path is
+    refused) but never invents a failure: an unresolvable path or unknown root
+    is let through, matching ``hermes_state._ensure_test_isolation``.
+    """
+    import os as _os
+    if _os.environ.get(_KANBAN_GUARD_BYPASS_ENV):
+        return
+    try:
+        from hermes_state_guard import _in_test_context
+    except Exception:
+        return
+    if not _in_test_context():
+        return
+    root = _real_kanban_root()
+    if root is None:
+        return
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except Exception:
+        return
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return  # Not under the real root — safe.
+    raise RuntimeError(
+        f"kanban_write_guard: kanban DB path resolved to {resolved}, which is "
+        f"under the REAL kanban root ({root}). Hermetic isolation has been "
+        f"bypassed — refusing to write to the real ~/.hermes. Point "
+        f"HERMES_HOME at a tmp dir, or export "
+        f"{_KANBAN_GUARD_BYPASS_ENV}=1 for a test that genuinely needs the "
+        f"live board. See #69283."
+    )
+
+
 def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
     every connection so a re-created file stays robust; the first connection
@@ -672,6 +749,9 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    # Before ANY mkdir/open — a guard that runs after mkdir has already
+    # created directories inside the real root.
+    _ensure_kanban_test_isolation(path)
     from agent.delegation_context import is_delegated_child_process_context
     if is_delegated_child_process_context():
         # Reads must not enter schema/backfill write transactions. Never create a

@@ -296,18 +296,156 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     )
 
 
+def _prior_work_reason(task_id: str) -> Optional[str]:
+    """Why this card must not be auto-decomposed, or None when it is fresh.
+
+    A card sitting in ``triage`` that has already been *executed* is not a raw
+    idea — it is work in progress whose evidence lives on the card. Fanning it
+    out mints new ids for work that already happened, and those children then
+    re-run it (2026-09-08: t_89ebac10 became t_3365d37e / t_a06ddf52 /
+    t_4e723a61, all three later closed as "duplicated work already finished").
+
+    Deliberately narrow: only execution counts. Comments and attachments do
+    not, so a human annotating a fresh idea never blocks its decomposition.
+    Best-effort — a DB error must not stop the decomposer.
+    """
+    try:
+        with kbc.connect_closing() as conn:
+            runs = conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,),
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT started_at FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            terminal = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+                "AND kind IN ('completed', 'gave_up')", (task_id,),
+            ).fetchone()[0]
+    except Exception as exc:
+        logger.debug("decompose: prior-work check failed on %s (%s)", task_id, exc)
+        return None
+    started = row["started_at"] if row is not None else None
+    if not (runs or started or terminal):
+        return None
+    marks = []
+    if runs:
+        marks.append(f"{runs} run(s)")
+    if terminal:
+        marks.append(f"{terminal} terminal event(s)")
+    if started:
+        marks.append("started_at set")
+    return (
+        "task already has prior work (" + ", ".join(marks) + "); decomposing it "
+        "would duplicate work whose evidence is already on the card — "
+        "pass force=True (CLI: --force) to decompose anyway"
+    )
+
+
+# Words that carry no scope signal — dropping them keeps the overlap check
+# from firing on shared boilerplate ("the", "for", "review", "task").
+_SCOPE_STOPWORDS = frozenset({
+    "a", "an", "and", "at", "against", "for", "from", "in", "into", "of", "on",
+    "or", "the", "to", "via", "with", "when", "that", "this", "its", "it",
+    "task", "card", "tasks", "cards",
+})
+# Overlap coefficient (shared / smaller set) rather than Jaccard: a short,
+# focused card and a long, detailed one about the SAME thing score low on
+# Jaccard purely because the longer title has more words.
+_SCOPE_OVERLAP_THRESHOLD = 0.5
+_SCOPE_MIN_SHARED = 3
+
+
+def _scope_tokens(title: str) -> set:
+    """Significant, lightly-stemmed tokens from a card title."""
+    words = re.findall(r"[a-z0-9]+", (title or "").lower())
+    out = set()
+    for w in words:
+        if w in _SCOPE_STOPWORDS or len(w) < 3:
+            continue
+        # Crude singularisation so skill/skills and profile/profiles match.
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        out.add(w)
+    return out
+
+
+def _overlapping_open_card(conn, task_id: str, title: str) -> Optional[tuple]:
+    """An OPEN card, other than ``task_id``, that already covers this scope.
+
+    Returns ``(id, title)`` or None. Deliberately advisory: the caller refuses
+    to decompose and leaves the card in triage for a human, rather than
+    deleting or merging anything on a similarity heuristic.
+
+    Exists because on 2026-09-06 the decomposer fanned out the SAME problem
+    twice, 17 minutes apart, into seven cards, while a claimed card was
+    already working it. Two of the resulting workers then edited the same
+    source files concurrently.
+    """
+    mine = _scope_tokens(title)
+    if len(mine) < _SCOPE_MIN_SHARED:
+        return None
+    rows = conn.execute(
+        "SELECT id, title FROM tasks "
+        "WHERE id != ? AND status IN ('ready', 'running', 'todo', 'review') "
+        "ORDER BY created_at DESC LIMIT 400",
+        (task_id,),
+    ).fetchall()
+    for r in rows:
+        other = _scope_tokens(r["title"])
+        if not other:
+            continue
+        shared = mine & other
+        if len(shared) < _SCOPE_MIN_SHARED:
+            continue
+        if len(shared) / min(len(mine), len(other)) >= _SCOPE_OVERLAP_THRESHOLD:
+            return (r["id"], r["title"])
+    return None
+
+
 def decompose_task(
     task_id: str,
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    force: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
-    (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
+    (not in triage, no aux client, API error, malformed/empty reply, prior work
+    on the card) surface as ``ok=False``.
+
+    ``force`` skips BOTH duplicate-work guards for an operator who means it;
+    the gateway's auto-decompose path never sets it.
+    """
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # Two independent duplicate-work guards, both bypassed by ``force``. They
+    # answer different questions and neither subsumes the other:
+    #   _prior_work_reason     — has THIS card already been executed?
+    #   _overlapping_open_card — does ANOTHER open card already own this scope?
+    # The 2026-09-08 t_89ebac10 fan-out needed the first; the 2026-09-06
+    # t_d0888211 double fan-out needed the second.
+    if not force:
+        blocked_reason = _prior_work_reason(task_id)
+        if blocked_reason:
+            return DecomposeOutcome(task_id, False, blocked_reason)
+
+        # Do not fan out scope an open card already owns. Decomposing it again
+        # produces a second implementer for the same work, and two dispatched
+        # workers editing the same files is a corruption hazard, not just
+        # wasted tokens.
+        try:
+            with kbc.connect_closing() as _c:
+                dupe = _overlapping_open_card(_c, task_id, task.title)
+        except Exception:
+            dupe = None  # Never let the guard block decomposition on a DB hiccup.
+        if dupe is not None:
+            return DecomposeOutcome(
+                task_id, False,
+                f"scope already owned by open card {dupe[0]} ({dupe[1]!r}) — "
+                f"left in triage for a human to merge or override",
+            )
 
     routing = _load_routing()
     raw, reason = _call_aux(
