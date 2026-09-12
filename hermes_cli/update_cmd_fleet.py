@@ -67,6 +67,42 @@ def _clear_fleet_restart_pending_marker() -> None:
     _m()._clear_marker_file(_fleet_restart_pending_marker_path(), label="fleet-restart-pending")
 
 
+def clear_fleet_restart_pending_if_fleet_current() -> bool:
+    """Discharge the pull->restart obligation when every live gateway runs the current tree.
+
+    A successful ``hermes gateway restart`` IS the obligation the marker records, but the
+    marker carries no runtime inventory (it short-circuits ``_pending_fleet_restart_needed``
+    unconditionally), so it may only be discharged against a live, identity-matched fleet.
+    Fail closed: an empty matrix, any row that is not ``current`` at the checkout SHA, an
+    unresolvable checkout, or a probe error all leave the marker for the next catch-up.
+
+    Without this, the marker was reachable for clearing only from inside ``hermes update``,
+    so the startup banner's own advice could not silence it and operators were funnelled
+    into ``hermes update`` -- which resets the checkout to origin/main and discards locally
+    merged fixes. Returns True only when the marker was actually cleared.
+    """
+    with suppress(OSError):
+        if not _fleet_restart_pending_marker_path().is_file():
+            return False
+
+    expected_sha = _current_checkout_sha()
+    if not expected_sha:
+        return False
+    try:
+        from hermes_cli.update_receipt import collect_fleet_versions
+        fleet = collect_fleet_versions()
+    except Exception as exc:
+        logger.debug("Could not probe fleet to clear restart-pending marker: %s", exc)
+        return False
+    if not fleet or any(
+        row.get("state") != "current" or row.get("code_sha") != expected_sha
+        for row in fleet
+    ):
+        return False
+    _clear_fleet_restart_pending_marker()
+    return True
+
+
 def _current_checkout_sha() -> str | None:
     """Current on-disk checkout HEAD, or None if it cannot be resolved."""
     from hermes_cli.update_cmd import _capture_head_sha, _m
