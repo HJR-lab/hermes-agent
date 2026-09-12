@@ -7,10 +7,11 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import get_configured_fallback_chain
 
-# Normalized fallback chain (merges legacy ``fallback_model``); always a fresh copy.
-_read_chain = get_fallback_chain
+# Normalized fallback chain (merges legacy ``fallback_model``); always a fresh copy. The configured
+# chain, not the effective one: a pinned profile must not lose its entries on the next write.
+_read_chain = get_configured_fallback_chain
 
 
 _MISSING_ACTIVE_PROVIDER = object()

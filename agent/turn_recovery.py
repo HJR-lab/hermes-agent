@@ -592,6 +592,15 @@ def _failed_turn_result(final_response: str, messages: Any, api_call_count: int,
     }
 
 
+def _pinned_route_note(agent: Any, provider: Any, model: Any) -> str:
+    """Terminal diagnostic for a profile pinned by ``model.allow_fallback: false``, naming the route
+    that could not serve so an outage never reads as a silent provider switch. Empty otherwise."""
+    if getattr(agent, "_fallback_allowed", True):
+        return ""
+    return (f"No fallback attempted: this profile is pinned to {provider}/{model} "
+            "(model.allow_fallback: false). Retry once that provider can serve again.")
+
+
 def _print_nonretryable_auth_guidance(
     agent: Any, classified: Any, *, status_code: Optional[int], provider: Any, base_url: Any, model: Any,
 ) -> None:
@@ -749,16 +758,24 @@ def nonretryable_client_error_result(
         return _content_policy_blocked_result(
             messages, api_call_count, final_response=_policy_response, error_detail=_nonretryable_summary,
         )
+    _pin_note = _pinned_route_note(agent, provider, model)
+    if _pin_note:
+        agent._emit_status(f"🔒 {_pin_note}")
     # Billing walls get the same structured recovery descriptor as the max-retries path
     # so every surface renders one consistent signal.
     if classified.reason == FailoverReason.billing:
-        return _billing_failure_result(
+        result = _billing_failure_result(
             classified=classified, summary=_nonretryable_summary, messages=messages,
             api_call_count=api_call_count, provider=provider, base_url=base_url, model=model,
         )
+        if _pin_note:
+            result["final_response"] += f"\n\n{_pin_note}"
+        return result
     _final_response = _nonretryable_summary
     if _welcome_hint:
         _final_response += f"\n\n{_welcome_tier_guidance(classified, model=model, in_chat=True)}"
+    if _pin_note:
+        _final_response += f"\n\n{_pin_note}"
     result = _failed_turn_result(_final_response, messages, api_call_count, _nonretryable_summary)
     # Same verdict fields as the max-retries path: without them the UI descriptor
     # (agent/error_surface.py) reads a rejected OAuth token as a retryable
@@ -888,6 +905,10 @@ def max_retries_exhausted_result(
             "execute_code with Python's open() for large "
             "files, or to write in smaller sections."
         )
+    _pin_note = _pinned_route_note(agent, provider, model)
+    if _pin_note:
+        agent._emit_status(f"🔒 {_pin_note}")
+        _final_response += f"\n\n{_pin_note}"
     result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall

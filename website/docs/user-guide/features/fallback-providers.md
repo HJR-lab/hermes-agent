@@ -108,6 +108,25 @@ fallback_providers:
     key_env: MY_LOCAL_KEY            # env var name containing the API key
 ```
 
+### Pinning a Profile to Its Primary (No Fallback)
+
+Some profiles must never be served by another provider — for example an agent whose identity is a specific harness, or one whose fallback would drain a shared plan. Pin it:
+
+```bash
+hermes config set model.allow_fallback false
+```
+
+```yaml
+model:
+  provider: claude-code-cli
+  default: claude-opus-5
+  allow_fallback: false
+```
+
+While pinned, the profile never switches providers: the primary-model fallback is skipped (including a chain handed to a subagent or restored by the gateway), and auxiliary tasks no longer fall through to `fallback_providers`. An explicit `auxiliary.<task>.fallback_chain` still applies to that task. When the primary cannot serve, the turn ends with the provider's own error plus a line naming the pinned route. A kanban worker that stops on a rate limit or usage window exits with the rate-limit code, so the dispatcher requeues the card without counting a failure.
+
+`fallback_providers` entries are kept while the pin is set — `hermes fallback` still lists and edits them — but nothing uses them until `allow_fallback` is removed or set to `true`.
+
 ### When Fallback Triggers
 
 The fallback activates automatically when the primary model fails with:

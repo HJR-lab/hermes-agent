@@ -54,13 +54,32 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def fallback_allowed(config: dict[str, Any] | None) -> bool:
+    """False when ``model.allow_fallback`` is explicitly off, pinning the profile to its primary route.
+
+    A pinned profile stops on a provider outage instead of silently serving (and billing) another
+    provider — a rate-limited Claude profile once ran two days of kanban work on Codex this way.
+    Absent means allowed, so only profiles that opt in change behaviour.
+    """
+    from utils import is_truthy_value
+
+    model = (config or {}).get("model")
+    return not isinstance(model, dict) or is_truthy_value(model.get("allow_fallback"), default=True)
+
+
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Return the effective fallback chain merged across old and new config keys.
+    """Return the fallback chain the runtime may use: the configured chain, or ``[]`` when
+    ``model.allow_fallback`` pins the profile to its primary route."""
+    return get_configured_fallback_chain(config) if fallback_allowed(config) else []
+
+
+def get_configured_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the fallback chain as written, merged across old and new config keys.
 
     ``fallback_providers`` remains the primary source of truth and keeps its order. Legacy
     ``fallback_model`` entries are appended afterwards unless they target the same
     provider/model/base_url route as an earlier entry. The returned list always contains fresh dict
-    copies.
+    copies. Ignores ``model.allow_fallback``: this is for editing the chain, not for running it.
     """
     config = config or {}
     chain: list[dict[str, Any]] = []

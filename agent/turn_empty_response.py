@@ -265,12 +265,12 @@ def recover_empty_response(
         )
 
     # Exhausted retries — try the next provider in the chain before "(empty)".
-    if _truly_empty and agent._fallback_chain:
+    if _truly_empty and agent._has_pending_fallback():
         logger.warning(
             "Empty response after %d retries — attempting fallback (model=%s, provider=%s)",
             agent._empty_content_retries, agent.model, agent.provider,
         )
-        agent._buffer_status("⚠️ Model returning empty responses — " "switching to fallback provider...")
+        agent._buffer_status("⚠️ Model returning empty responses — switching to fallback provider...")
         if agent._try_activate_fallback():
             active_system_prompt = _sync_failover_system_message(agent, api_messages, active_system_prompt)
             agent._empty_content_retries = 0

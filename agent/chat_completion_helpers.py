@@ -1830,6 +1830,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    if not getattr(agent, "_fallback_allowed", True):
+        # ``model.allow_fallback: false`` — the profile serves from its primary route or not at all,
+        # whatever chain a caller handed this agent.
+        logger.warning("Fallback suppressed: %s/%s is pinned (model.allow_fallback: false)",
+                       getattr(agent, "provider", ""), getattr(agent, "model", ""))
+        return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):

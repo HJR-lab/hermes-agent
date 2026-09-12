@@ -1294,6 +1294,18 @@ class TestRateLimitErrorWithoutStatusCode:
         assert result.reason != FailoverReason.rate_limit
 
 
+class TestClaudeCodeSubscriptionWindow:
+    """Claude Code reports plan windows as harness text with no HTTP status. Unmatched, the wall read
+    as a generic failure: the worker could not exit rate-limited and the loop walked the fallback chain."""
+
+    @pytest.mark.parametrize("message", [
+        "Claude Code CLI exited 1: You've hit your session limit · resets 12am (Asia/Singapore)",
+        "Claude Code CLI exited 1: You've hit your weekly limit · resets Sep 15, 9am",
+    ])
+    def test_subscription_window_is_a_rate_limit(self, message):
+        result = classify_api_error(RuntimeError(message), provider="claude-code-cli", model="claude-opus-5")
+        assert result.reason == FailoverReason.rate_limit
+
 
 # ── Test: multimodal_tool_content_unsupported pattern ───────────────────
 

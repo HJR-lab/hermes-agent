@@ -118,6 +118,10 @@ _RATE_LIMIT_PATTERNS = (
     "resource exhausted", "resource_exhausted", "resource-exhausted", "resourceexhausted",
     "rate increased too quickly", "throttlingexception", "too many concurrent requests",
     "servicequotaexceededexception", "throttling",
+    # Claude Code subscription windows: harness text with no HTTP status ("You've hit your session
+    # limit · resets 12am"). Unmatched, the wall read as a generic failure and walked the fallback chain.
+    "hit your session limit", "hit your weekly limit", "hit your limit", "session limit reached",
+    "weekly limit reached", "5-hour limit reached",
 )
 
 # Server busy, credential fine: back off on the same key, never rotate. Z.AI/

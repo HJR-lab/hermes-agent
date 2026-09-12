@@ -238,7 +238,8 @@ def nous_rate_limit_guard(
                     _nous_msg = anon_auth.FREE_TIER_RATE_LIMIT_CHAT.format(reset=reset)
                 else:
                     _nous_msg = f"Nous Portal rate limit active — resets in {reset}."
-                agent._buffer_vprint(f"⏳ {_nous_msg} Trying fallback...")
+                if getattr(agent, "_fallback_allowed", True):
+                    agent._buffer_vprint(f"⏳ {_nous_msg} Trying fallback...")
                 agent._buffer_status(f"⏳ {_nous_msg}")
                 if agent._try_activate_fallback():
                     active_system_prompt = _arm_fallback_restart(
@@ -249,17 +250,25 @@ def nous_rate_limit_guard(
                 # No fallback — surface the buffered rate-limit context that led here.
                 agent._flush_status_buffer()
                 agent._persist_session(messages, conversation_history)
-                return _verdict("return", {
-                    "final_response": (
-                        f"⏳ {_nous_msg}\n\n"
+                if getattr(agent, "_fallback_allowed", True):
+                    _no_fallback = (
                         "No fallback provider available. Try again after the reset, or add a "
                         "fallback provider in config.yaml."
-                    ),
+                    )
+                else:
+                    _no_fallback = (
+                        f"No fallback attempted: this profile is pinned to {agent.provider}/{agent.model} "
+                        "(model.allow_fallback: false). Retry once that provider can serve again."
+                    )
+                return _verdict("return", {
+                    "final_response": f"⏳ {_nous_msg}\n\n{_no_fallback}",
                     "messages": messages,
                     "api_calls": api_call_count,
                     "completed": False,
                     "failed": True,
                     "error": _nous_msg,
+                    "failure_reason": "rate_limit",
+                    "failure_retryable": True,
                 })
         except Exception:
             pass  # Never let rate guard break the agent loop

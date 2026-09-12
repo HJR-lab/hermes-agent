@@ -1,7 +1,26 @@
-"""Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
+"""Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution and the allow_fallback pin."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import resolve_entry_api_key
+from hermes_cli.fallback_config import (
+    get_configured_fallback_chain, get_fallback_chain, resolve_entry_api_key,
+)
+
+
+class TestAllowFallbackPin:
+    CHAIN = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+
+    def test_pinned_profile_has_no_runtime_chain_but_keeps_its_entries(self):
+        # Every runtime reader goes through get_fallback_chain, so it must come back empty; `hermes
+        # fallback` reads the configured chain and writes it back, so that must not lose the entries.
+        for off in (False, "false"):
+            cfg = {"model": {"provider": "claude-code-cli", "allow_fallback": off}, "fallback_providers": self.CHAIN}
+            assert get_fallback_chain(cfg) == []
+            assert get_configured_fallback_chain(cfg) == self.CHAIN
+
+    def test_profiles_without_the_pin_keep_their_chain(self):
+        for model in ({}, {"allow_fallback": True}, "legacy-model-string"):
+            cfg = {"model": model, "fallback_providers": self.CHAIN}
+            assert get_fallback_chain(cfg) == get_configured_fallback_chain(cfg) == self.CHAIN
 
 
 class TestResolveEntryApiKey:

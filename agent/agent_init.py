@@ -2275,20 +2275,28 @@ def init_agent(
     _init_turn_state(agent, run_budget_seconds)
     _setup_logging(agent)
     _set_defaults(agent, _STREAM_STATE)
-    _build_client(agent, api_key, base_url, fallback_model)
+
+    # Load config once for fallback policy, memory, skills, and compression. This must precede client
+    # construction: a missing primary credential can otherwise activate a caller-supplied fallback
+    # before the profile pin is known.
+    try:
+        from hermes_cli.config import load_config_readonly as _load_agent_config
+        _agent_cfg = _load_agent_config()
+    except Exception:
+        _agent_cfg = {}
+
+    # Read from the profile's own config, not the caller's chain: a chain handed in by a surface that
+    # never looked at ``model.allow_fallback`` must still be refused at init and during turn recovery.
+    from hermes_cli.fallback_config import fallback_allowed
+    agent._fallback_allowed = fallback_allowed(_agent_cfg)
+
+    _build_client(agent, api_key, base_url, fallback_model if agent._fallback_allowed else None)
     _init_fallback_chain(agent, fallback_model)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)
     _init_session_state(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
     )
-
-    # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config_readonly as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
-        _agent_cfg = {}
 
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform)

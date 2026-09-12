@@ -4006,10 +4006,12 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
         pass  # never block signal handling
 
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> "dict | None":
     """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
 
-    The caller swallows all errors: a broken loop must never wedge a worker.
+    Returns the last loop turn's result (None when no loop turn ran) so the caller can exit
+    rate-limited when that turn hit a quota wall. The caller swallows all errors: a broken loop must
+    never wedge a worker.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
@@ -4033,12 +4035,22 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     if not goal_text:
         return
 
+    from hermes_cli.kanban_worker_exit import quota_wall_reason
+
+    last_turn: dict = {}
+
+    class _QuotaWall(Exception):
+        """The provider refused to serve: judging the failure or re-prompting cannot change that."""
+
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
+        last_turn["result"] = result
         _sync_cli_session_id_from_agent(cli)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
+        if quota_wall_reason(result) is not None:
+            raise _QuotaWall(result["failure_reason"])  # the loop stops on a run_turn error
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -4054,6 +4066,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
     )
+    return last_turn.get("result")
 
 
 def _sync_cli_session_id_from_agent(cli) -> None:
@@ -4093,10 +4106,16 @@ def _run_quiet_single_query(cli, effective_query):
         print(response)
 
     # Kanban goal_mode: keep working in THIS session until a judge agrees the card is
-    # done, the worker terminates it, or the turn budget runs out (sticky block).
-    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+    # done, the worker terminates it, or the turn budget runs out (sticky block). A turn
+    # that hit a quota wall ends the worker instead: judging the failure or re-prompting
+    # only hits the wall again, and the requeue below is the truthful outcome.
+    from hermes_cli.kanban_worker_exit import quota_wall_reason, worker_exit_code
+
+    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and quota_wall_reason(result) is None:
         try:
-            _run_kanban_goal_loop_q(cli, response)
+            last_loop_result = _run_kanban_goal_loop_q(cli, response)
+            if quota_wall_reason(last_loop_result) is not None:
+                result = last_loop_result
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 
@@ -4105,8 +4124,6 @@ def _run_quiet_single_query(cli, effective_query):
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
     # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
     # the task without counting a failure (a quota window must not trip the breaker).
-    from hermes_cli.kanban_worker_exit import worker_exit_code
-
     sys.exit(worker_exit_code(result, kanban_task=os.environ.get("HERMES_KANBAN_TASK", "")))
 
 
