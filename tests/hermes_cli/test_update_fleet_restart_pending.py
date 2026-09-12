@@ -609,3 +609,22 @@ def test_startup_warn_silent_when_nothing_pending(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+def test_startup_warn_prescribes_the_restart_and_not_another_update(capsys):
+    """The banner's remedy must be the restart it can actually be discharged by.
+
+    The pull already happened; what is owed is a fleet restart. Offering `hermes update`
+    as an equal remedy funnelled operators into the one command that `git reset --hard`s
+    the checkout to origin/<branch> -- on a diverged checkout that moves locally merged
+    fixes off the working branch to a rescue ref. Restarting is also fleet-wide: the
+    marker is only discharged when every live gateway runs the current tree, so a
+    single-profile restart leaves the banner up.
+    """
+    update_cmd._write_fleet_restart_pending_marker()
+    update_cmd._warn_pending_fleet_restart_on_startup()
+    err = capsys.readouterr().err
+
+    assert "hermes gateway restart --all" in err
+    assert "Run `hermes update`" not in err
+    assert "resets this checkout to origin/" in err
