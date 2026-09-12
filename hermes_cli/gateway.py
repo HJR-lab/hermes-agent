@@ -6126,6 +6126,23 @@ def _restart_all(system: bool) -> None:
 
 
 def _cmd_restart(args):
+    """Restart the gateway, then discharge any pending fleet-restart obligation.
+
+    The ``fleet_restart_pending`` marker makes every CLI invocation warn that gateways may
+    be serving pre-update modules. Clearing it used to be reachable only from inside
+    ``hermes update``, so the banner outlived the very restart it recommended and pushed
+    operators toward ``hermes update`` -- which resets the checkout to origin/main and
+    discards locally merged fixes. The clear is verified against the live fleet and fails
+    closed, so an aborted or partial restart (any non-clean exit here) keeps the marker.
+    """
+    _cmd_restart_impl(args)
+    from hermes_cli.update_cmd_fleet import clear_fleet_restart_pending_if_fleet_current
+    with contextlib.suppress(Exception):
+        if clear_fleet_restart_pending_if_fleet_current():
+            print("✓ Cleared the pending fleet-restart warning.")
+
+
+def _cmd_restart_impl(args):
     _refuse_from_inside_gateway("restart", "restart loops")
     system = getattr(args, "system", False)
     restart_all = getattr(args, "all", False)
