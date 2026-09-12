@@ -234,12 +234,21 @@ def _pending_fleet_restart_needed() -> bool:
 
 
 def _warn_pending_fleet_restart(*, startup: bool = False) -> None:
-    """Print the specific interrupted-update fleet-restart warning."""
+    """Print the specific interrupted-update fleet-restart warning.
+
+    Prescribe only the restart. The pull already happened, so what is owed is a fleet
+    restart -- and the obligation is discharged only when *every* live gateway runs the
+    current tree, hence ``--all``. Naming ``hermes update`` as an equal remedy funnelled
+    operators into the one command that ``git reset --hard``s the checkout to
+    origin/<branch>, which on a diverged checkout moves locally merged fixes off the
+    working branch onto a rescue ref.
+    """
     stream = sys.stderr if startup else sys.stdout
     print("⚠ A previous `hermes update` pulled new code but did not restart running gateways.", file=stream)
     print("  Gateways may still be serving pre-update modules (mixed sys.modules).", file=stream)
     if startup:
-        print("  Run `hermes update` or `hermes gateway restart`.", file=stream)
+        print("  Run `hermes gateway restart --all` — the pull is done; only the restart is owed.", file=stream)
+        print("  Do not re-run `hermes update` for this: it resets this checkout to origin/<branch>.", file=stream)
 
 
 def _warn_pending_fleet_restart_on_startup() -> None:
