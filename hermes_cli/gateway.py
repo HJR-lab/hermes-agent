@@ -5879,7 +5879,7 @@ def _stop_installed_service(system: bool) -> bool:
 
 
 def _refuse_from_inside_gateway(verb: str, reason: str) -> None:
-    """Refuse self-targeting stop/restart/uninstall from inside the gateway process (#92560)."""
+    """Refuse self-targeting stop/restart/uninstall from inside the gateway process (#92560) or a descendant of it."""
     from tools.process_registry import _is_supervised_gateway_process
     if _is_supervised_gateway_process():
         print_error(
@@ -5888,6 +5888,39 @@ def _refuse_from_inside_gateway(verb: str, reason: str) -> None:
             f"Use `hermes gateway {verb}` from a shell outside the running gateway."
         )
         sys.exit(1)
+    gateway_pid = _gateway_ancestor_pid()
+    if gateway_pid is not None:
+        print_error(
+            f"Refusing to {verb} the gateway from a process it spawned (gateway PID {gateway_pid}).\n"
+            f"This command would terminate the gateway supervising this process mid-turn.\n"
+            f"Ask the operator to run `hermes gateway {verb}` from a shell outside the running gateway."
+        )
+        sys.exit(1)
+
+
+def _gateway_ancestor_pid() -> int | None:
+    """Nearest ancestor that is a live Hermes gateway, or None.
+
+    Descendants (kanban workers, terminal children) inherit ``_HERMES_GATEWAY=1`` but never own the
+    gateway PID, so the self-check above misses them. Deliberate restarters (restart watcher, dashboard
+    actions, update recovery) pop the marker first and stay allowed. The ancestor matches the current
+    profile's PID file or any profile's ``gateway run`` argv; lookup failures fail open.
+    """
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return None
+    try:
+        from gateway.status import _looks_like_gateway_process, get_running_pid
+        running_pid = get_running_pid(cleanup_stale=False)
+    except Exception:
+        return None
+    seen = {os.getpid()}
+    pid = _get_parent_pid(os.getpid())
+    while pid is not None and pid > 1 and pid not in seen and len(seen) < 64:
+        if pid == running_pid or _looks_like_gateway_process(pid):
+            return pid
+        seen.add(pid)
+        pid = _get_parent_pid(pid)
+    return None
 
 
 def _print_lines(*lines: str) -> None:
