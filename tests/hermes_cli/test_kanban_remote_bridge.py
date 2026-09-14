@@ -179,6 +179,22 @@ def test_runner_crash_resumes_without_rerunning_the_agent(env):
     assert _journal(env, card_id)["attempts"] == 1
 
 
+def test_remote_liveness_relays_one_bounded_heartbeat_per_interval(env):
+    (env.state / "mode").write_text("sleep 6")
+    card_id = _create(env)
+    _tick(env)
+    relayed = []
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        relayed += _tick(env).heartbeats
+        time.sleep(0.3)
+    assert _row(env, card_id)["status"] == "running"
+    # Many ticks inside one relay interval: the card sees the remote alive exactly once.
+    assert relayed == [card_id] and _event_kinds(env, card_id).count("heartbeat") == 1
+    _tick_until(env, card_id, "done")
+    assert _invocations(env) == 1
+
+
 def test_malformed_result_blocks_instead_of_completing(env):
     (env.state / "mode").write_text("malformed")
     card_id = _create(env)
