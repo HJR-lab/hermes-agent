@@ -467,7 +467,7 @@ def install_remote_agent(assignee: RemoteAssignee) -> int:
 
 
 def cmd_remote_bridge(args: argparse.Namespace) -> int:
-    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from hermes_cli.config import load_config
     cfg = load_config()
     try:
@@ -480,7 +480,7 @@ def cmd_remote_bridge(args: argparse.Namespace) -> int:
     with tick_lock(assignee) as acquired:
         if not acquired:
             return 0
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             report = bridge_tick(conn, assignee, SshTransport(assignee))
     # Silent when nothing changed, so an idle poller writes no log lines.
     if report.changed() or args.verbose:
