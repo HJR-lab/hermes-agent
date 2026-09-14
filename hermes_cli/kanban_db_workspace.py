@@ -145,6 +145,15 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
+        if wp.is_dir() and (wp / ".git").exists():
+            # A scratch folder that is really a git checkout (the auto-decomposer can
+            # hand several cards one shared worktree recorded as 'scratch') gets the
+            # worktree guard: dirty, unpushed or undeterminable state preserves it.
+            # A bare rmtree here deleted ~3,200 uncommitted lines on 2026-09-14.
+            _cleanup_worker_tmux(conn, task_id)
+            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if wp.is_dir():
             # Containment guard: a board's ``default_workdir`` can pair
             # ``workspace_kind='scratch'`` with a user path pointing at a real
@@ -241,6 +250,12 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
                 continue
             wp = Path(row["workspace_path"])
+            if wp.is_dir() and (wp / ".git").exists():
+                # Same guard as _cleanup_workspace: a shared scratch folder that is a
+                # git checkout is only reclaimed when provably free of work. This
+                # deferred parent sweep is the path that fired on 2026-09-14.
+                _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
+                continue
             if wp.is_dir() and _is_managed_scratch_path(wp):
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
