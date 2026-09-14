@@ -1216,14 +1216,20 @@ def check_respawn_guard(
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
-    """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
-    imported (local import avoids a cycle; callers fall back to trusting the
-    assignee)."""
+    """Local spawnability: ``hermes_cli.profiles.profile_exists`` minus configured
+    ``kanban.remote_assignees``, which run on another host via ``hermes kanban
+    remote-bridge`` and must never spawn here, even if a same-named local profile
+    reappears. ``None`` when profiles cannot be imported (local import avoids a
+    cycle; callers fall back to trusting the assignee)."""
     try:
         from hermes_cli.profiles import profile_exists
     except Exception:
         return None
-    return profile_exists
+    from hermes_cli.kanban_remote_bridge import configured_remote_assignee_names
+    remote = configured_remote_assignee_names()
+    if not remote:
+        return profile_exists
+    return lambda name: str(name).strip().lower() not in remote and profile_exists(name)
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
