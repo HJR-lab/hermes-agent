@@ -397,6 +397,16 @@ _SPECS = [
     ], help="Emit a heartbeat event for a running task (worker liveness signal)"),
     _cmd("assignees", [_json_flag()],
          help="List known profiles + per-profile task counts (union of ~/.hermes/profiles/ and current assignees on the board)"),
+    _cmd("remote-bridge", children=("remote_bridge_action", [
+        _cmd("tick", [
+            _arg("--assignee", required=True, help="Name under kanban.remote_assignees"),
+            _arg("--verbose", action="store_true", help="Print the tick report even when nothing changed"),
+        ], help="Dispatch ready cards and relay heartbeats/results for one remote assignee "
+                "(model-free; silent when idle)"),
+        _cmd("install-agent", [
+            _arg("--assignee", required=True, help="Name under kanban.remote_assignees"),
+        ], help="Copy the remote journal agent to the assignee's host and verify its sha256"),
+    ]), help="Bridge cards to remote assignees that run Hermes on another host (kanban.remote_assignees)"),
     _cmd("context", [_TASK_ID],
          help="Print the full context a worker sees for a task (title + body + parent results + comments)."),
     _cmd("specify", _triage_sweep_args("specify", "Specify", "specifier"),
