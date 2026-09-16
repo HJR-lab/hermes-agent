@@ -89,8 +89,9 @@ class CodexAppServerClient:
         owned_task = os.environ.get("HERMES_KANBAN_TASK") and is_dispatcher_owned_worker_context()
         if owned_task:
             server = HERMES_TOOLS_MCP_SERVER_NAME
-            # An env override against a server config.toml does not define synthesises an env-only
-            # table, and codex refuses to start ("invalid transport"). Scope only a registered server.
+            # An env override naming a server that config.toml does not define synthesises an
+            # env-only table, and codex refuses to start ("invalid transport"): scope only a
+            # server that is actually registered.
             if _codex_config_defines_mcp_server(spawn_env.get("CODEX_HOME"), server):
                 # HERMES_PROFILE is attribution, not authority: without it every board write
                 # from a codex worker records author/created_by "worker" instead of the profile,
