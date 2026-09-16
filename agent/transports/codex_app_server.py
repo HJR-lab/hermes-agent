@@ -92,7 +92,10 @@ class CodexAppServerClient:
             # An env override against a server config.toml does not define synthesises an env-only
             # table, and codex refuses to start ("invalid transport"). Scope only a registered server.
             if _codex_config_defines_mcp_server(spawn_env.get("CODEX_HOME"), server):
-                for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+                # HERMES_PROFILE is attribution, not authority: without it every board write
+                # from a codex worker records author/created_by "worker" instead of the profile,
+                # which erases the audit trail the Kanban lifecycle exists to keep.
+                for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_PROFILE"):
                     if key in os.environ:
                         cmd += ["-c", f"mcp_servers.{server}.env.{key}={json.dumps(os.environ[key])}"]
                 cmd += ["-c", f'mcp_servers.{server}.env.{DELEGATED_CHILD_ENV_MARKER}=""']

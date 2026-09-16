@@ -338,6 +338,22 @@ class TestKanbanScopeTargetsRegisteredMcpServer:
         assert not self._scoped_servers(cmd)
         assert 'sandbox_mode="workspace-write"' in cmd
 
+    def test_scope_carries_the_worker_profile_for_board_attribution(self, monkeypatch, tmp_path):
+        """kanban_comment/kanban_create read HERMES_PROFILE for author/created_by and fall back
+        to the literal "worker". The MCP server runs in its own process, so a scope grant that
+        omits the profile silently attributes every codex worker's board write to "worker" and
+        the audit trail stops naming which agent acted."""
+        from hermes_cli.codex_runtime_plugin_migration import migrate
+
+        assert migrate({}, codex_home=tmp_path, discover_plugins=False,
+                       default_permission_profile=None).written
+        monkeypatch.setenv("HERMES_PROFILE", "duex")
+
+        cmd = self._spawn_cmd(monkeypatch, tmp_path)
+
+        overrides = [cmd[i + 1] for i, part in enumerate(cmd[:-1]) if part == "-c"]
+        assert 'mcp_servers.hermes-tools.env.HERMES_PROFILE="duex"' in overrides
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
