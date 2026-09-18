@@ -446,3 +446,119 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
 
+
+
+class TestKanbanScopeTargetsRegisteredMcpServer:
+    """The per-worker ``-c mcp_servers.<name>.env.*`` scope overrides must name the server
+    migrate() registers.
+
+    b578261584 had the transport say "hermes-mcp" while migrate() wrote "hermes-tools":
+    against an undefined table the override synthesises an env-only server with no command
+    or url, codex rejects it as "invalid transport", and every dispatcher-owned codex worker
+    died at initialize — exiting rc=0 without kanban_complete, which the dispatcher scores as
+    a protocol violation and retries forever (t_11df335a). The two sides are edited in
+    different files, so pin them against each other rather than against a literal.
+    """
+
+    @staticmethod
+    def _spawn_cmd(monkeypatch, codex_home):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        # A dispatcher-owned worker: task scope present, delegated-child fence absent.
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(codex_home / "kanban.db"))
+
+        client = cas.CodexAppServerClient(codex_bin="codex", codex_home=str(codex_home))
+        client._closed = True  # so close() is a no-op
+        return captured["cmd"]
+
+    @staticmethod
+    def _scoped_servers(cmd):
+        """Server names appearing in ``-c mcp_servers.<name>....`` overrides."""
+        overrides = [cmd[i + 1] for i, part in enumerate(cmd[:-1]) if part == "-c"]
+        return {o.split(".", 2)[1] for o in overrides if o.startswith("mcp_servers.")}
+
+    def test_overrides_name_the_server_migrate_registers(self, monkeypatch, tmp_path):
+        import tomllib
+
+        from hermes_cli.codex_runtime_plugin_migration import migrate
+
+        report = migrate({}, codex_home=tmp_path, discover_plugins=False,
+                         default_permission_profile=None)
+        assert report.written, report.errors
+        servers = tomllib.loads((tmp_path / "config.toml").read_text())["mcp_servers"]
+
+        scoped = self._scoped_servers(self._spawn_cmd(monkeypatch, tmp_path))
+
+        assert scoped, "an owned Kanban worker must scope the Hermes tools MCP server"
+        for name in scoped:
+            assert name in servers, f"-c override targets unregistered [mcp_servers.{name}]"
+            entry = servers[name]
+            assert entry.get("command") or entry.get("url"), (
+                f"[mcp_servers.{name}] has no stdio/http transport; codex refuses to start")
+
+    def test_unowned_worker_scopes_no_mcp_server(self, monkeypatch, tmp_path):
+        """No dispatcher task => no scope grant at all (the fence stays closed)."""
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        assert self._scoped_servers(self._spawn_cmd_unowned(monkeypatch, tmp_path)) == set()
+
+    @staticmethod
+    def _spawn_cmd_unowned(monkeypatch, codex_home):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        client = cas.CodexAppServerClient(codex_bin="codex", codex_home=str(codex_home))
+        client._closed = True
+        return captured["cmd"]
