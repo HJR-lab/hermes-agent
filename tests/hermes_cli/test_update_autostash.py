@@ -156,6 +156,7 @@ def _make_update_side_effect(
     update_ref_fails=False,
     pre_pull_sha_unavailable=False,
     existing_rescue_refs=None,
+    local_only_count=None,
 ):
     """Build a subprocess.run side_effect for cmd_update tests.
 
@@ -176,6 +177,10 @@ def _make_update_side_effect(
     ``existing_rescue_refs`` simulates the refs already present under
     ``refs/hermes-update-backups/orphan-<branch>-*`` (oldest first) so the
     ``_prune_orphan_rescue_refs`` cleanup pass has something to trim.
+
+    ``local_only_count`` answers ``git rev-list --count origin/<branch>..HEAD`` (the
+    commits a reset would destroy) independently of ``commit_count`` (the behind
+    count). ``None`` leaves both on ``commit_count``.
     """
     recorded = []
     head_sha_calls = []
@@ -208,6 +213,8 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
+            if local_only_count is not None and f"origin/{current_branch}..HEAD" in joined:
+                return SimpleNamespace(stdout=f"{local_only_count}\n", stderr="", returncode=0)
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "merge-base" in joined:
             if merge_base_exists:
@@ -427,13 +434,45 @@ def test_prune_orphan_rescue_refs_leaves_unparseable_names_alone():
     assert delete_calls == []
 
 
-def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, capsys):
-    """Common ancestor still exists (e.g. upstream force-push) → no rescue
-    ref, no orphan messaging, behavior identical to before #87694."""
+def test_cmd_update_ordinary_divergence_rescues_local_commits(monkeypatch, tmp_path, capsys):
+    """Common ancestor exists but this branch carries commits origin does not: the reset
+    would destroy them, so an ``ahead-`` rescue ref AND a visible rescue branch are written
+    first, with no orphan messaging (t_05f9f4be; this reversed the pre-fix contract that
+    only orphan divergence was backed up)."""
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
-        ff_only_fails=True, merge_base_exists=True,
+        ff_only_fails=True, merge_base_exists=True, local_only_count="2",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    update_ref_calls = [c for c in recorded if "update-ref" in c and "-d" not in c]
+    assert len(update_ref_calls) == 1
+    assert update_ref_calls[0][2].startswith("refs/hermes-update-backups/ahead-main-")
+    branch_calls = [c for c in recorded if len(c) > 2 and c[1] == "branch" and c[2].startswith("hermes-update-rescue/main-")]
+    assert len(branch_calls) == 1, "local commits must also land on a branch operators can see"
+    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
+    assert len(reset_calls) == 1, "the rescue never blocks the update"
+
+    out = capsys.readouterr().out
+    assert "orphan divergence" not in out
+    assert "2 local commit(s) on 'main' are not on origin/main" in out
+    assert "hermes-update-rescue/main-" in out
+    assert "Fast-forward not possible (history diverged), resetting to match remote" in out
+
+
+def test_cmd_update_ordinary_divergence_without_local_commits_skips_rescue_ref(
+    monkeypatch, tmp_path, capsys
+):
+    """Common ancestor exists and nothing on HEAD is missing from origin (e.g. an upstream
+    force-push over a checkout with no local work) → nothing to lose, so no rescue ref, no
+    rescue branch, no orphan messaging: behavior identical to before #87694."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=True, local_only_count="0",
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -441,9 +480,11 @@ def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, 
 
     update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
     assert update_ref_calls == []
+    assert [c for c in recorded if len(c) > 1 and c[1] == "branch" and "hermes-update-rescue" in " ".join(c)] == []
 
     out = capsys.readouterr().out
     assert "orphan divergence" not in out
+    assert "would be destroyed by the reset" not in out
     assert "Fast-forward not possible (history diverged), resetting to match remote" in out
 
 
