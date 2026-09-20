@@ -136,11 +136,14 @@ def handle_api_error(
 
     retry_count += 1
     elapsed_time = time.time() - api_start_time
+    # Liveness/watchdog label only (never shown in chat), so the classifier's
+    # "not retryable" verdict is named on the logged attempt line below instead.
     agent._touch_activity(f"API error recovery (attempt {retry_count}/{max_retries})")
 
     error_type, error_msg, _provider, _base, _model = log_api_error_attempt(
         agent, api_error, retry_count=retry_count, max_retries=max_retries, status_code=status_code,
         elapsed_time=elapsed_time, api_messages=api_messages, approx_tokens=approx_tokens,
+        retryable=bool(classified.retryable),
     )
 
     if agent._interrupt_requested:
@@ -283,9 +286,17 @@ def settle_unrecovered_error(
     shrink_spent = classified.reason == FailoverReason.image_too_large and bool(
         getattr(_retry, "image_shrink_retry_attempted", False)
     )
+    # Same shape for the reasoning-disable rung: the retry already went out without the disable,
+    # so a second reasoning-field rejection means the route refuses the configured reasoning
+    # controls themselves — nothing left to drop, so take the fallback chain now instead of
+    # replaying the identical request ``max_retries`` times (#114460).
+    reasoning_spent = classified.reason == FailoverReason.reasoning_mandatory and bool(
+        getattr(_retry, "reasoning_mandatory_retry_attempted", False)
+    )
     is_client_error = (
         is_local_validation_error
         or shrink_spent
+        or reasoning_spent
         or (
             not classified.retryable
             and not classified.should_compress
@@ -321,7 +332,7 @@ def settle_unrecovered_error(
         # the cascade. An UNCLASSIFIED local ValueError/TypeError keeps its historical fallback;
         # a recognised verdict that opts out wins even when the exception is a ValueError subclass.
         _unclassified_local = is_local_validation_error and classified.reason == FailoverReason.unknown
-        if classified.should_fallback or _unclassified_local or shrink_spent:
+        if classified.should_fallback or _unclassified_local or shrink_spent or reasoning_spent:
             # Announce the fallback only when a chain exists, else "trying fallback..." lies
             # before a silent abort.
             if agent._has_pending_fallback():
@@ -362,6 +373,17 @@ def settle_unrecovered_error(
             active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
             retry_count = compression_attempts = 0
             return _verdict("break")
+        # Fallback first (above); only with nothing left to move to does the bounded auto-recovery
+        # ladder park the turn on a transient outage instead of ending it (#85426, #107307).
+        from agent.turn_recovery_autorecover import auto_recover_after_exhaustion
+        _ladder = auto_recover_after_exhaustion(
+            agent, api_error, classified, _retry, messages=messages,
+            conversation_history=conversation_history, api_call_count=api_call_count,
+        )
+        if _ladder is not None:
+            if _ladder["action"] == "continue":
+                retry_count = 0
+            return _verdict(_ladder["action"], _ladder.get("result"))
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, max_retries=max_retries, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
