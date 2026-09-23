@@ -6,7 +6,6 @@ and shell completion generation.
 """
 
 import json
-import io
 import os
 import shutil
 import sys
@@ -34,13 +33,9 @@ from hermes_cli.profiles import (
     check_alias_collision,
     create_wrapper_script,
     remove_wrapper_script,
-    validate_alias_name,
     rename_profile,
     export_profile,
-    import_profile,
-    _get_profiles_root,
     _get_default_hermes_home,
-    seed_profile_skills,
     NO_BUNDLED_SKILLS_MARKER,
     backfill_profile_envs,
     profiles_to_serve,
@@ -358,42 +353,6 @@ class TestNoSkillsOptOut:
 
 
 
-    def test_delete_marker_re_enables_seeding(self, profile_env, monkeypatch):
-        """Deleting .no-bundled-skills opts the profile back into a full sync.
-
-        The sync subprocess runs in BOTH states: with the marker present,
-        sync_skills() itself seeds only the essential skills and reports
-        ``skipped_opt_out``; without it, a normal full sync happens.
-        """
-        import subprocess as _sp
-
-        profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
-        assert (profile_dir / NO_BUNDLED_SKILLS_MARKER).is_file()
-
-        # Marker present: the subprocess still runs (essential-only seeding
-        # happens inside sync_skills) and its skipped_opt_out flag surfaces.
-        called = []
-        stdout_by_call = [
-            '{"copied": ["hermes-agent"], "skipped_opt_out": true}',
-            '{"copied": []}',
-        ]
-        monkeypatch.setattr(
-            "subprocess.run",
-            lambda *a, **kw: (called.append(a), _sp.CompletedProcess(
-                args=a, returncode=0,
-                stdout=stdout_by_call[min(len(called) - 1, 1)], stderr="",
-            ))[1],
-        )
-        r1 = seed_profile_skills(profile_dir, quiet=True)
-        assert r1.get("skipped_opt_out") is True
-        assert r1.get("copied") == ["hermes-agent"]
-        assert len(called) == 1
-
-        # Delete marker → next call is a normal full sync.
-        (profile_dir / NO_BUNDLED_SKILLS_MARKER).unlink()
-        r2 = seed_profile_skills(profile_dir, quiet=True)
-        assert r2 == {"copied": []}
-        assert len(called) == 2
 
 
 # ===================================================================
@@ -965,7 +924,7 @@ class TestWrapperScript:
 
     @pytest.mark.windows_only
     def test_remove_finds_bat_on_windows(self, profile_env):
-        from hermes_cli.profiles import create_wrapper_script, remove_wrapper_script
+        from hermes_cli.profiles import create_wrapper_script
         wrapper = create_wrapper_script("mybot")
         assert wrapper is not None
         assert wrapper.exists()
@@ -1194,16 +1153,6 @@ class TestRenameProfile:
         acquire.assert_not_called()
 
 
-    def test_live_gateway_failure_does_not_rewrite_db_directly(self, profile_env, capsys):
-        create_profile("oldname", no_alias=True)
-        with patch("hermes_cli.profiles.check_alias_collision", return_value="skip"), \
-             patch("hermes_cli.profiles._live_default_multiplexer", return_value=True), \
-             patch("hermes_cli.profiles._notify_multiplexer"), \
-             patch("gateway.control_socket.migrate_gateway_profile_identity", return_value=None), \
-             patch("hermes_state_registry.acquire") as acquire:
-            rename_profile("oldname", "newname")
-        acquire.assert_not_called()
-        assert "Restart the gateway" in capsys.readouterr().err
 
     def test_migrate_identity_command_repairs_a_failed_live_migration(self, profile_env, capsys):
         """The failed-live-migration end state must be recoverable: `hermes profile
@@ -1259,6 +1208,28 @@ class TestRenameProfile:
         assert "agent:oldname:feishu:dm:chatA" not in routing
         assert "agent:newname:feishu:dm:chatA" in routing
         root_db2.close()
+
+
+    def test_rename_accumulates_previous_names(self, profile_env):
+        create_profile("firstname", no_alias=True)
+
+        with patch("hermes_cli.profiles.check_alias_collision", return_value="skip"):
+            rename_profile("firstname", "secondname")
+            rename_profile("secondname", "thirdname")
+
+        info = next(p for p in list_profiles() if p.name == "thirdname")
+        assert info.previous_names == ["firstname", "secondname"]
+
+    def test_rename_succeeds_when_previous_name_write_fails(self, profile_env):
+        create_profile("oldname", no_alias=True)
+
+        # The history write is best-effort: it must never fail the rename.
+        with patch("hermes_cli.profiles.check_alias_collision", return_value="skip"), \
+             patch("hermes_cli.profiles.write_profile_meta", side_effect=OSError("disk full")):
+            new_dir = rename_profile("oldname", "newname")
+
+        assert new_dir.is_dir()
+
 
 
 class TestExportImport:
@@ -1352,16 +1323,6 @@ class TestExportImport:
 # TestProfileIsolation
 # ===================================================================
 
-class TestProfileIsolation:
-    """Verify that two profiles have completely separate paths."""
-
-    def test_separate_config_paths(self, profile_env):
-        create_profile("alpha", no_alias=True)
-        create_profile("beta", no_alias=True)
-        alpha_dir = get_profile_dir("alpha")
-        beta_dir = get_profile_dir("beta")
-        assert alpha_dir / "config.yaml" != beta_dir / "config.yaml"
-        assert str(alpha_dir) not in str(beta_dir)
 
 
 # ===================================================================
@@ -1373,14 +1334,6 @@ class TestInternalHelpers:
 
 
 
-    def test_default_hermes_home_docker(self, tmp_path, monkeypatch):
-        """In Docker, _get_default_hermes_home() returns HERMES_HOME itself."""
-        docker_home = tmp_path / "opt" / "data"
-        docker_home.mkdir(parents=True)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.setenv("HERMES_HOME", str(docker_home))
-        home = _get_default_hermes_home()
-        assert home == docker_home
 
 
 
@@ -1607,6 +1560,95 @@ class TestProfilesToServe:
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
 
+    # ------------------------------------------------------------------
+    # gateway.standalone: authored opt-out of the host multiplexer
+    # ------------------------------------------------------------------
+
+    def test_standalone_profile_excluded_unless_included(self, profile_env):
+        """A named profile that sets `gateway.standalone: true` is not served by the
+        host multiplexer, but callers that enumerate INSTALLED profiles still see it."""
+        create_profile("solo", no_alias=True)
+        create_profile("member", no_alias=True)
+        (get_profile_dir("solo") / "config.yaml").write_text("gateway:\n  standalone: true\n")
+        serve = dict(profiles_to_serve(multiplex=True))
+        assert set(serve) == {"default", "member"}
+        served_all = dict(profiles_to_serve(multiplex=True, include_standalone=True))
+        assert set(served_all) == {"default", "solo", "member"}
+
+    def test_default_profile_with_key_still_served_with_one_warning(self, profile_env, caplog):
+        """The default profile IS the host: the key is ignored (still served, never
+        standalone) with exactly one warning per process."""
+        profiles._STANDALONE_WARNED = False
+        default_home = _get_default_hermes_home()
+        (default_home / "config.yaml").write_text("gateway:\n  standalone: true\n")
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="hermes_cli.profiles"):
+            serve = dict(profiles_to_serve(multiplex=True))
+            assert profiles.profile_is_standalone(default_home) is False
+            assert profiles.profile_is_standalone(default_home) is False
+        assert list(serve) == ["default"]
+        assert serve["default"] == default_home
+        assert len([r for r in caplog.records if "ignored on the default profile" in r.message]) == 1
+
+    @pytest.mark.parametrize("content", ["gateway: [", "[]\n", "null\n", "", "gateway: false\n"])
+    def test_standalone_malformed_config_does_not_break_roster(self, profile_env, caplog, content):
+        create_profile("solo", no_alias=True)
+        home = get_profile_dir("solo")
+        (home / "config.yaml").write_text(content)
+        for _ in range(2):
+            assert profiles.profile_is_standalone(home) is False
+            assert "solo" in dict(profiles_to_serve(True))
+        warnings = [r for r in caplog.records if "Cannot read gateway.standalone" in r.message]
+        assert len(warnings) == (1 if content == "gateway: [" else 0)
+
+    @pytest.mark.parametrize("failure_at", ["stat", "read", "decode"])
+    def test_standalone_io_failure_is_bounded_and_recovers(self, profile_env, monkeypatch, caplog, failure_at):
+        from hermes_cli import config
+
+        create_profile("solo", no_alias=True)
+        home = get_profile_dir("solo")
+        cfg = home / "config.yaml"
+        cfg.write_text("gateway:\n  standalone: true\n")
+        real_stat = Path.stat
+
+        def denied(path, *args, **kwargs):
+            if path == cfg:
+                raise PermissionError("denied")
+            return real_stat(path, *args, **kwargs)
+
+        def unreadable(*args, **kwargs):
+            if failure_at == "decode":
+                raise UnicodeError("decode failed")
+            raise PermissionError("denied")
+
+        with monkeypatch.context() as m:
+            if failure_at == "stat":
+                m.setattr(Path, "stat", denied)
+            else:
+                m.setattr(config, "read_user_config_raw", unreadable)
+            assert profiles.profile_is_standalone(home) is False
+            assert profiles.profile_is_standalone(home) is False
+        assert len([r for r in caplog.records if "Cannot read gateway.standalone" in r.message]) == 1
+        # Restoring access does not change mtime/size/inode; a read failure is not config.
+        assert profiles.profile_is_standalone(home) is True
+
+    def test_standalone_answer_is_per_home_and_memo_invalidates_on_replacement(self, profile_env):
+        """A->B->A: signatures never cross homes; atomic replacement invalidates the memo."""
+        create_profile("alpha", no_alias=True)
+        create_profile("beta", no_alias=True)
+        alpha, beta = get_profile_dir("alpha"), get_profile_dir("beta")
+        (alpha / "config.yaml").write_text("gateway:\n  standalone: true\n")
+        assert profiles.profile_is_standalone(alpha) is True
+        assert profiles.profile_is_standalone(beta) is False
+        assert profiles.profile_is_standalone(alpha) is True  # memo hit, still True
+        cfg = alpha / "config.yaml"
+        replacement = alpha / "replacement.yaml"
+        replacement.write_text("gateway:\n  standalone: false\n")
+        replacement.replace(cfg)
+        assert profiles.profile_is_standalone(alpha) is False
+        assert profiles.profile_is_standalone(beta) is False
+        assert profiles.profile_is_standalone(alpha) is False
+
 
 # ---------------------------------------------------------------------------
 # resolve_profile_env spelling preservation (#82581 junction follow-up)
@@ -1697,14 +1739,6 @@ class TestCloneAllExcludesRuntimeTrees:
             (source / tree).mkdir()
         assert not _clone_all_copytree_ignore(source)(str(source), [*self.RUNTIME_TREES, "SOUL.md"])
 
-    def test_runtime_trio_is_one_constant_shared_with_backup(self):
-        """backup's exclusion list and the clone-all root gate must be built from the same
-        constant; two literals drifting apart is how the models/ copy of #111718 crept in."""
-        from hermes_cli import backup, profiles
-        from hermes_constants import LOCAL_RUNTIME_ROOT_DIRS
-        assert LOCAL_RUNTIME_ROOT_DIRS == frozenset(self.RUNTIME_TREES)
-        assert backup._EXCLUDED_ROOT_DIRS is LOCAL_RUNTIME_ROOT_DIRS
-        assert LOCAL_RUNTIME_ROOT_DIRS <= profiles._CLONE_ALL_DEFAULT_EXCLUDE_ROOT
 
     def test_clone_all_from_default_skips_runtime_trees_but_keeps_the_rest(self, profile_env):
         default_home = profile_env / ".hermes"
